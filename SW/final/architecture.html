@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>RTOS Architecture</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#fff;font-family:'Segoe UI','Malgun Gothic',sans-serif;display:flex;justify-content:center;padding:20px}
+  .c{width:960px}
+  h1{text-align:center;font-size:22px;font-weight:800;color:#1a1a2e;margin-bottom:14px}
+
+  .core{border:2.5px solid;border-radius:12px;padding:14px;margin-bottom:10px;position:relative}
+  .c0{border-color:#3b82f6;background:#eff6ff}
+  .c1{border-color:#10b981;background:#ecfdf5}
+  .cl{position:absolute;top:-12px;left:16px;padding:1px 12px;border-radius:7px;font-size:12px;font-weight:700;color:#fff}
+  .c0 .cl{background:#3b82f6}
+  .c1 .cl{background:#10b981}
+
+  .t{background:#fff;border:1.5px solid #d1d5db;border-radius:8px;padding:10px 12px;margin-bottom:8px}
+  .tt{font-size:13px;font-weight:700;color:#374151;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+  .p{font-size:10px;background:#6b7280;color:#fff;padding:1px 7px;border-radius:8px;font-weight:600}
+  .p5{background:#ef4444}.p4{background:#f97316}.p3{background:#eab308;color:#1a1a2e}.p2{background:#3b82f6}.p1{background:#6b7280}
+
+  .ch{display:flex;flex-wrap:wrap;gap:4px}
+  .c_{font-size:11px;font-weight:600;padding:3px 9px;border-radius:5px;background:#f3f4f6;border:1px solid #e5e7eb;color:#374151}
+  .ca{background:#dbeafe;border-color:#93c5fd;color:#1e40af}
+  .cs{background:#d1fae5;border-color:#6ee7b7;color:#065f46}
+  .cf{background:#fef3c7;border-color:#fcd34d;color:#92400e;font-style:italic}
+  .cm{background:#fce7f3;border-color:#f9a8d4;color:#9d174d}
+
+  .row{display:flex;gap:10px}
+  .row>*{flex:1}
+
+  .isr{background:#fef2f2;border:1.5px dashed #f87171;border-radius:7px;padding:7px 12px;text-align:center;font-size:11px;font-weight:600;color:#991b1b}
+
+  .q{background:#f5f3ff;border:2px solid #a78bfa;border-radius:9px;padding:10px;text-align:center;margin-bottom:10px}
+  .q .tt{justify-content:center;color:#5b21b6}
+
+  .ble{background:#1e293b;color:#fff;border-radius:9px;padding:10px;text-align:center;font-size:13px;font-weight:700;margin-bottom:10px}
+
+  .fl{background:#fffbeb;border:2px solid #f59e0b;border-radius:9px;padding:10px;text-align:center}
+  .fl .tt{justify-content:center;color:#b45309}
+
+  .arr{display:flex;justify-content:center;padding:3px 0}
+  .vl{width:2px;height:14px;background:#9ca3af}
+  .va{width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:7px solid #9ca3af}
+
+  .hf{display:flex;align-items:center;justify-content:center;gap:6px;padding:4px 0;font-size:11px;font-weight:600;color:#6b7280}
+  .ha{width:30px;height:2px;background:#9ca3af;position:relative}
+  .ha::after{content:'';position:absolute;right:-1px;top:-3px;border-left:7px solid #9ca3af;border-top:4px solid transparent;border-bottom:4px solid transparent}
+
+  .sd{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:#9ca3af;font-weight:600}
+  .sd .ln{flex:1;height:1px;background:#d1d5db}
+
+  table{width:100%;border-collapse:collapse;margin-top:14px;font-size:11px}
+  th{background:#1e293b;color:#fff;padding:6px 10px;text-align:left;font-weight:700}
+  td{padding:6px 10px;border-bottom:1px solid #e5e7eb;color:#374151}
+  tr:nth-child(even) td{background:#f9fafb}
+</style>
+</head>
+<body>
+<div class="c">
+
+  <h1>2026 ALTIS Avionics — RTOS Architecture</h1>
+
+  <div class="ble">BLE / Serial Communication</div>
+
+  <!-- CORE 0 -->
+  <div class="core c0">
+    <div class="cl">CORE 0</div>
+    <div class="t">
+      <div class="tt">CMD Task <span class="p p1">Pri 1</span></div>
+      <div class="ch">
+        <span class="c_ ca">START</span>
+        <span class="c_ ca">STOP</span>
+        <span class="c_ ca">CALIBRATE</span>
+        <span class="c_ ca">PARSE</span>
+        <span class="c_ ca">ERASE</span>
+        <span class="c_ ca">REBOOT</span>
+      </div>
+    </div>
+    <div class="t">
+      <div class="tt">Flush Task <span class="p p2">Pri 2</span></div>
+      <div class="hf">
+        <span class="c_">logQueue Recv</span>
+        <div class="ha"></div>
+        <span class="c_">appendRaw</span>
+        <div class="ha"></div>
+        <span class="c_">flushPages</span>
+        <div class="ha"></div>
+        <span class="c_ cs">Flash Write</span>
+      </div>
+    </div>
+    <div class="fl">
+      <div class="tt">MX25L Flash Memory (128Mbit)</div>
+      <div class="ch" style="justify-content:center">
+        <span class="c_">imu_pkt (19B)</span>
+        <span class="c_">baro_pkt (11B)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- logQueue -->
+  <div class="q">
+    <div class="tt">logQueue (FreeRTOS Queue — 48 × 32B)</div>
+    <div class="hf" style="color:#7c3aed">NAV Task (Core 1) ──────▶ Flush Task (Core 0)</div>
+  </div>
+
+  <!-- CORE 1 -->
+  <div class="core c1">
+    <div class="cl">CORE 1</div>
+
+    <div class="row" style="margin-bottom:6px">
+      <div class="isr">⚡ HW INT → ISR (GPIO 47)<br>IMU DRDY → TaskNotifyGive</div>
+      <div class="isr">⚡ HW INT → ISR (GPIO 9)<br>BMP DRDY → TaskNotifyGive</div>
+    </div>
+
+    <div class="arr"><div class="vl"></div></div>
+    <div class="arr"><div class="va"></div></div>
+
+    <div class="row">
+      <div class="t">
+        <div class="tt">IMU Task <span class="p p5">Pri 5</span></div>
+        <div class="ch">
+          <span class="c_ cm">spiMutex</span>
+          <span class="c_ cs">readRawIMU()</span>
+          <span class="c_" style="font-size:10px">12B burst SPI</span>
+        </div>
+        <div style="height:4px"></div>
+        <div class="ch">
+          <span class="c_ cm">dataMutex</span>
+          <span class="c_ cs">nav.updateIMU()</span>
+        </div>
+      </div>
+      <div class="t">
+        <div class="tt">BMP Task <span class="p p4">Pri 4</span></div>
+        <div class="ch">
+          <span class="c_ cm">spiMutex</span>
+          <span class="c_ cs">readPressure()</span>
+        </div>
+        <div style="height:4px"></div>
+        <div class="ch">
+          <span class="c_ cm">dataMutex</span>
+          <span class="c_ cs">nav.updatePress()</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sd"><div class="ln"></div>xTaskNotify (Event Bits)<div class="ln"></div></div>
+
+    <div class="t">
+      <div class="tt">NAV Task <span class="p p3">Pri 3</span></div>
+      <div class="row">
+        <div>
+          <div class="ch">
+            <span class="c_ cm">dataMutex</span>
+            <span class="c_">getRaw_imu()</span>
+            <span class="c_">getState_press()</span>
+          </div>
+          <div style="height:4px"></div>
+          <div class="ch">
+            <span class="c_ ca">Create imu_pkt</span>
+            <span class="c_ ca">Create baro_pkt</span>
+            <span class="c_ ca">xQueueSend</span>
+          </div>
+        </div>
+        <div>
+          <div class="ch">
+            <span class="c_ cf">EKF Predict (TODO)</span>
+            <span class="c_ cf">EKF Update (TODO)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sync table -->
+  <table>
+    <tr><th style="width:130px">Sync Object</th><th style="width:120px">Type</th><th>Protected Resource</th></tr>
+    <tr><td><b>spiMutex</b></td><td>Mutex</td><td>Sensor SPI Bus — IMU Task, BMP Task, Calibrate</td></tr>
+    <tr><td><b>dataMutex</b></td><td>Mutex</td><td>NAV Internal State — IMU/BMP Task ↔ NAV Task</td></tr>
+    <tr><td><b>flashMutex</b></td><td>Mutex</td><td>Flash Access — STOP / PARSE / ERASE commands</td></tr>
+    <tr><td><b>logQueue</b></td><td>Queue (48×32B)</td><td>Packet Transfer — NAV Task → Flush Task</td></tr>
+    <tr><td><b>TaskNotifyGive</b></td><td>Direct Notify</td><td>ISR → IMU/BMP Task (wake on DRDY)</td></tr>
+    <tr><td><b>xTaskNotify</b></td><td>Event Bits</td><td>IMU/BMP Task → NAV Task (EVENT_IMU / EVENT_BMP)</td></tr>
+  </table>
+
+</div>
+</body>
+</html>
