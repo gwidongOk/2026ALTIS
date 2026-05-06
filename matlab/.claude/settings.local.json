@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'NR > 50 && NR < 70' \"C:\\\\Users\\\\pc\\\\Documents\\\\capstone\\\\capstone\\\\ES_EKF\\\\scenari\\\\2026_04_23_openrocket.csv\")",
+      "Bash(awk -F',' 'NR > 100 && NR < 110 {print $1, $18, $19}' \"C:\\\\Users\\\\pc\\\\Documents\\\\capstone\\\\capstone\\\\ES_EKF\\\\scenari\\\\openrocket.csv\")",
+      "Bash(awk -F',' 'NR > 300 && NR < 320 {print $1, $2, $11, $12, $18, $19}' \"C:\\\\Users\\\\pc\\\\Documents\\\\capstone\\\\capstone\\\\ES_EKF\\\\scenari\\\\openrocket.csv\")",
+      "Bash(awk -F',' 'NR > 500 && NR < 520 {print $1, $2, $18, $19}' \"C:\\\\Users\\\\pc\\\\Documents\\\\capstone\\\\capstone\\\\ES_EKF\\\\scenari\\\\openrocket.csv\")"
+    ]
+  }
+}
