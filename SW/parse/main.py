@@ -148,7 +148,7 @@ class App(tk.Tk):
         self.tree.heading('t',    text='Time (us)')
         self.tree.heading('val',  text='Data')
         self.tree.column('type', width=60,  anchor=tk.CENTER)
-        self.tree.column('t',    width=110, anchor=tk.RIGHT)
+        self.tree.column('t',    width=110, anchor='e')
         self.tree.column('val',  width=420)
         vsb = ttk.Scrollbar(frm_tree, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)

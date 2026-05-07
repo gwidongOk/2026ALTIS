@@ -2,17 +2,17 @@
 % 단위
 t_imu_s = t_imu /1e+6;
 t_baro_s = t_baro /1e+6;
-acc_x_mps2 = rawacc_x * 0.976 * 0.001 * 9.80665;
-acc_y_mps2 = rawacc_y * 0.976 * 0.001 * 9.80665;
-acc_z_mps2 = rawacc_z * 0.976 * 0.001 * 9.80665;
+acc_x_mps2 = ax * 0.976 * 0.001 * 9.80665;
+acc_y_mps2 = ay * 0.976 * 0.001 * 9.80665;
+acc_z_mps2 = az * 0.976 * 0.001 * 9.80665;
 
-gyro_x_radps = rawgyro_x * 70 * 0.001 * (pi/180);
-gyro_y_radps = rawgyro_y * 70 * 0.001 * (pi/180);
-gyro_z_radps = rawgyro_z * 70 * 0.001 * (pi/180);
+gyro_x_radps = gx * 70 * 0.001 * (pi/180);
+gyro_y_radps = gy * 70 * 0.001 * (pi/180);
+gyro_z_radps = gz * 70 * 0.001 * (pi/180);
 
 %저주파 제거
-%detrended_alt = detrend(rawalt);
-detrended_alt = rawalt;
+detrended_alt = detrend(alt);
+% detrended_alt = alt;
 % 평균
 mean_acc_x = mean(acc_x_mps2);
 mean_acc_y = mean(acc_y_mps2);
