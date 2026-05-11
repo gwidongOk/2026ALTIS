@@ -59,10 +59,8 @@ class MX25Logger {
     // ============================================================
     void logImu  (const Raw_imu       &raw);
     void logBaro (const Raw_press     &p);
-    void logMag  (const Raw_mag       &m);
-    void logGps  (const Raw_gps       &g);
     void logState(const State_nominal &nom);
-    void logEvent(FlightPhase phase, uint8_t eventId); // New: Flight event logging
+    void logEvent(FlightPhase phase, uint8_t eventId);
 
     // Drain in-RAM queue → flash (called from FlushTask)
     void serviceFlush();

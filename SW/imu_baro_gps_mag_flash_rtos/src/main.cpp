@@ -6,8 +6,6 @@
 #include "Config.h"
 #include "LSM6DSO32.h"
 #include "BMP388.h"
-#include "MMC5983MA.h"
-#include "NEOM9N.h"
 #include "NAV.h"
 #include "MX25Logger.h"
 #include "sensor_data.h"
@@ -21,20 +19,15 @@ static SPIClass flashSPI(FSPI);
 
 static LSM6DSO32 imu(IMU_CS_PIN, &sensorSPI);
 static BMP388    bmp(BMP_CS_PIN, &sensorSPI);
-static MMC5983MA mag(&Wire);
-static NEOM9N    gps(Serial1, GPS_RX_PIN, GPS_TX_PIN);
 static NAV       nav;
 static MX25Logger logger;
 
 static TaskHandle_t TaskHandle_IMU   = NULL;
 static TaskHandle_t TaskHandle_BMP   = NULL;
-static TaskHandle_t TaskHandle_MAG   = NULL;
-static TaskHandle_t TaskHandle_GPS   = NULL;
 static TaskHandle_t FlightTaskHandle = NULL;
 static TaskHandle_t FlushTaskHandle  = NULL;
 
 static SemaphoreHandle_t spiMutex   = NULL;
-static SemaphoreHandle_t i2cMutex   = NULL;
 static SemaphoreHandle_t navMutex   = NULL;
 static SemaphoreHandle_t flashMutex = NULL;
 
@@ -44,8 +37,6 @@ static FlightPhase flightPhase = FlightPhase::PRE_FLIGHT;
 // Forward Declarations
 void IMU_Task(void *pvParameters);
 void BMP_Task(void *pvParameters);
-void MAG_Task(void *pvParameters);
-void GPS_Task(void *pvParameters);
 void Flight_Task(void *pvParameters);
 void FlushTask(void *pvParameters);
 void beep(int ms, int count = 1);
@@ -72,10 +63,9 @@ void setup() {
 
   // 2. Synchronizations
   spiMutex   = xSemaphoreCreateMutex();
-  i2cMutex   = xSemaphoreCreateMutex();
   navMutex   = xSemaphoreCreateMutex();
   flashMutex = xSemaphoreCreateMutex();
-  if (!spiMutex || !i2cMutex || !navMutex || !flashMutex) {
+  if (!spiMutex || !navMutex || !flashMutex) {
     beep(100, 3);
     while (1);
   }
@@ -83,17 +73,14 @@ void setup() {
   // 3. Communications
   initBLE(BLE_DEVICE_NAME);
   sensorSPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
-  Wire.begin(MAG_SDA_PIN, MAG_SCL_PIN, 400000);
 
   // 4. Sensors
   bool ok = true;
   if (!imu.begin()) { sendResponse("IMU FAIL\n"); ok = false; }
   if (!bmp.begin()) { sendResponse("BMP FAIL\n"); ok = false; }
-  if (!mag.begin()) { sendResponse("MAG FAIL\n"); ok = false; }
-  if (!gps.begin(10)) { sendResponse("GPS WARN\n"); } // Non-fatal
   
   if (!ok) { beep(100, 3); while(1); }
-  sendResponse("ALL SENSORS OK\n");
+  sendResponse("IMU+BARO OK\n");
 
   // 5. Storage
   logger.begin(&flashSPI, FLASH_SCK_PIN, FLASH_MISO_PIN, FLASH_MOSI_PIN, FLASH_CS_PIN, flashMutex);
@@ -107,13 +94,11 @@ void setup() {
   // 7. Tasks
   xTaskCreatePinnedToCore(IMU_Task, "IMU_T",  STACK_SIZE_SENSOR, NULL, TASK_C1_PRIO_IMU, &TaskHandle_IMU, 1);
   xTaskCreatePinnedToCore(BMP_Task, "BMP_T",  STACK_SIZE_SENSOR, NULL, TASK_C0_PRIO_BMP, &TaskHandle_BMP, 0);
-  xTaskCreatePinnedToCore(MAG_Task, "MAG_T",  STACK_SIZE_SENSOR, NULL, TASK_C0_PRIO_MAG, &TaskHandle_MAG, 0);
-  xTaskCreatePinnedToCore(GPS_Task, "GPS_T",  STACK_SIZE_SENSOR, NULL, TASK_C0_PRIO_GPS, &TaskHandle_GPS, 0);
   xTaskCreatePinnedToCore(Flight_Task,"Flt_T", 4096,              NULL, 3,                 &FlightTaskHandle, 0);
   xTaskCreatePinnedToCore(FlushTask,"Flush_T",STACK_SIZE_FLUSH,  NULL, TASK_C0_PRIO_FLUSH, &FlushTaskHandle, 0);
 
   beep(200);
-  sendResponse(">>> READY\n");
+  sendResponse(">>> 1-AXIS READY\n");
 }
 
 // ============================================================
@@ -158,38 +143,6 @@ void loop() {
         }
       }
     }
-    else if (cmd == "CALIBRATE_MAG") {
-      digitalWrite(LED_PIN, HIGH);
-      bool magOk = false;
-      while (!magOk) {
-        sendResponse("CALIBRATING MAG (30S)...\n");
-        if (mag.calibrate(MAG_CALIB_MS)) {
-          mag.clearInterruptFlag();
-          magOk = true;
-          sendResponse("MAG CALIB DONE.\n");
-          digitalWrite(LED_PIN, LOW); beep(200);
-        } else {
-          sendResponse("INSUFFICIENT ROTATION - RETRYING...\n");
-          beep(100, 3);
-          vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-      }
-    }
-    else if (cmd == "CALIBRATE_GPS") {
-      sendResponse("CALIBRATING GPS (AVERAGING)...\n");
-      bool gpsOk = false;
-      while (!gpsOk) {
-        if (gps.calibrate()) {
-          gpsOk = true;
-          sendResponse("GPS ORIGIN OK\n");
-          beep(200);
-        } else {
-          sendResponse("GPS DRIFTING OR NO FIX - RETRYING...\n");
-          beep(100, 3);
-          vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-      }
-    }
     else if (cmd == "ERASE") {
       sendResponse("ERASING FLASH...\n");
       logger.eraseAll();
@@ -197,63 +150,25 @@ void loop() {
       beep(500);
     }
     else if (cmd == "ZUPT") {
-      sendResponse("ALIGNING EKF...\n");
-      digitalWrite(LED_PIN, HIGH);
-
-      // 수렴 판정 파라미터
-      const int   MIN_ITER     = 10;     // 최소 1.0s (조기 false-positive 방지)
-      const int   MAX_ITER     = 200;    // 최대 20.0s (안전 상한)
-      const float REL_THRESH   = 1e-3f;  // P 상대 변화 0.1% 이하면 안정
-      const int   STABLE_REQ   = 3;      // 연속 안정 횟수
-
-      float P_prev = 0.0f;
-      int   stable_count = 0;
-      int   iter = 0;
-      bool  converged = false;
-
-      for (iter = 0; iter < MAX_ITER; iter++) {
-        if (xSemaphoreTake(navMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-          if (!nav.isEkfReady()) nav.ekfBegin();
-          nav.ekfUpdateStaticAlignment();
-          float P_now = nav.ekf().attBiasCovTrace();
+      sendResponse("ALIGNING KF...\n");
+      if (xSemaphoreTake(navMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+          nav.ekfBegin(); // Simplified: just init with current baro
           xSemaphoreGive(navMutex);
-
-          if (iter >= MIN_ITER && P_prev > 0.0f) {
-            float rel = fabsf(P_prev - P_now) / P_prev;
-            if (rel < REL_THRESH) {
-              if (++stable_count >= STABLE_REQ) { converged = true; break; }
-            } else {
-              stable_count = 0;
-            }
-          }
-          P_prev = P_now;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+          sendResponse("KF READY\n");
+          beep(100);
       }
-
-      char buf[80];
-      snprintf(buf, sizeof(buf), "ZUPT %s in %.1fs (P_trace=%.3e)\n",
-               converged ? "CONVERGED" : "TIMEOUT",
-               (iter + 1) * 0.1f, P_prev);
-      sendResponse(buf);
-      digitalWrite(LED_PIN, LOW); beep(100);
     }
     else if (cmd == "START") {
       sendResponse("STARTING...\n");
       if (xSemaphoreTake(navMutex, portMAX_DELAY) == pdTRUE) {
         if (!nav.isEkfReady()) {
-          if (!nav.ekfBegin()) {
-            sendResponse("EKF INIT FAIL\n");
-            xSemaphoreGive(navMutex);
-            beep(100, 3); return;
-          }
+          nav.ekfBegin();
         }
         xSemaphoreGive(navMutex);
       }
-      sendResponse("EKF READY\n");
+      sendResponse("KF READY\n");
 
       clearSensors();
-      mag.clearInterruptFlag();
       logger.setEnabled(true);
       flightActive = true;
       clearSensors(); 
@@ -304,7 +219,6 @@ void Flight_Task(void *pvParameters) {
   bool pyro1_active = false;
 
   for (;;) {
-    // START 명령이 올 때까지 무한 대기 (CPU 점유 0)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     
     flightPhase = FlightPhase::PRE_FLIGHT;
@@ -313,28 +227,24 @@ void Flight_Task(void *pvParameters) {
     while (flightActive) {
       vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100)); // 10Hz
 
-      // Non-blocking pyro control: Check if 1000ms has passed since activation
       if (pyro1_active && (millis() - pyro1_start_ms > 1000)) {
         digitalWrite(PYRO_1_PIN, LOW);
         pyro1_active = false;
       }
 
       State_nominal s;
-      State_imu imu_state;
       if (xSemaphoreTake(navMutex, 0) == pdTRUE) {
         s = nav.getNominal();
-        imu_state = nav.getStateImu();
         xSemaphoreGive(navMutex);
       } else continue;
 
       float alt = -s.p[2];
       float vel_up = -s.v[2];
       
-      // 현재 가속도 크기 계산 (EKF가 추정한 동적 바이어스까지 제거)
-      float ax = imu_state.ax - s.ba[0];
-      float ay = imu_state.ay - s.ba[1];
-      float az = imu_state.az - s.ba[2];
-      float amag = sqrtf(ax*ax + ay*ay + az*az);
+      // Vertical acceleration from KF bias-corrected state
+      // (Approximate using 1D KF bias)
+      float az_corr = nav.getStateImu().az - s.ba[2] - 9.80665f;
+      float amag = fabsf(az_corr);
 
       switch (flightPhase) {
         case FlightPhase::PRE_FLIGHT:
@@ -346,31 +256,24 @@ void Flight_Task(void *pvParameters) {
           break;
 
         case FlightPhase::POWERED_FLIGHT:
-          static bool reached_high_g = false;
-          if (amag > 20.0f) reached_high_g = true;
-          
-          if (reached_high_g && amag < 10.0f) {
+          if (amag < 2.0f && vel_up > 10.0f) { // Simple burnout: low acceleration while still fast
             flightPhase = FlightPhase::COASTING;
             logger.logEvent(flightPhase, 2);
             sendResponse("BO\n");
-            reached_high_g = false;
           }
           break;
 
         case FlightPhase::COASTING: {
-          // Apogee detection: 3 consecutive samples (300ms) with descent speed
           static uint8_t descent_count = 0;
-          if (vel_up < -1.0f && alt > 15.0f) { // Threshold tightened: -1.0m/s, >15m alt
+          if (vel_up < -0.5f && alt > 15.0f) {
             descent_count++;
             if (descent_count >= 3) {
               flightPhase = FlightPhase::DESCENT;
               logger.logEvent(flightPhase, 3);
               sendResponse("APG\n");
-              
               digitalWrite(PYRO_1_PIN, HIGH);
               pyro1_start_ms = millis();
               pyro1_active = true;
-              
               descent_count = 0;
             }
           } else {
@@ -437,48 +340,6 @@ void BMP_Task(void *pvParameters) {
       nav.updatePress(p);
       xSemaphoreGive(navMutex);
     }
-  }
-}
-
-void MAG_Task(void *pvParameters) {
-  Raw_mag m;
-  for (;;) {
-    bool got = false;
-    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
-      if (mag.isDataReady()) {
-        m.timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
-        mag.readCalibratedMag(m.mx, m.my, m.mz);
-        mag.clearInterruptFlag();
-        got = true;
-      }
-      xSemaphoreGive(i2cMutex);
-    }
-    if (!got) { vTaskDelay(pdMS_TO_TICKS(MAG_POLL_MS)); continue; }
-    
-    if (flightActive) logger.logMag(m);
-    
-    if (xSemaphoreTake(navMutex, portMAX_DELAY) == pdTRUE) {
-      nav.updateMag(m); 
-      xSemaphoreGive(navMutex);
-    }
-  }
-}
-
-void GPS_Task(void *pvParameters) {
-  Raw_gps g;
-  for (;;) {
-    if (gps.update()) {
-      g.timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
-      g.hasPos    = gps.getNED(g.pn, g.pe, g.pd, g.vn, g.ve, g.vd, g.hAcc, g.vAcc, g.fixType, g.numSV);
-      
-      if (flightActive) logger.logGps(g);
-      
-      if (xSemaphoreTake(navMutex, portMAX_DELAY) == pdTRUE) {
-        nav.updateGps(g); 
-        xSemaphoreGive(navMutex);
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(GPS_POLL_MS));
   }
 }
 

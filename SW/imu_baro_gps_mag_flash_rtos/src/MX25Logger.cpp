@@ -290,30 +290,6 @@ void MX25Logger::logBaro(const Raw_press &p) {
   _push(&pkt, sizeof(pkt));
 }
 
-void MX25Logger::logMag(const Raw_mag &m) {
-  mag_pkt pkt;
-  pkt.header.SYNC_BYTE = 0xAA;
-  pkt.header.id        = ID_MAG;
-  pkt.header.len       = sizeof(pkt);
-  pkt.t  = m.timestamp;
-  pkt.mx = m.mx; pkt.my = m.my; pkt.mz = m.mz;
-  _push(&pkt, sizeof(pkt));
-}
-
-void MX25Logger::logGps(const Raw_gps &g) {
-  gps_pkt pkt;
-  pkt.header.SYNC_BYTE = 0xAA;
-  pkt.header.id        = ID_GPS;
-  pkt.header.len       = sizeof(pkt);
-  pkt.t  = g.timestamp;
-  pkt.pn = g.pn; pkt.pe = g.pe; pkt.pd = g.pd;
-  pkt.vn = g.vn; pkt.ve = g.ve; pkt.vd = g.vd;
-  pkt.hAcc = g.hAcc; pkt.vAcc = g.vAcc;
-  pkt.fixType = g.fixType;
-  pkt.numSV   = g.numSV;
-  _push(&pkt, sizeof(pkt));
-}
-
 void MX25Logger::logState(const State_nominal &nom) {
   state_pkt pkt;
   pkt.header.SYNC_BYTE = 0xAA;
