@@ -8,8 +8,6 @@
 // ============================================================
 #define ID_BARO  1
 #define ID_IMU   2
-#define ID_MAG   3
-#define ID_GPS   4
 #define ID_STATE 5
 #define ID_EVENT 6
 
@@ -17,34 +15,17 @@
 // In-RAM sensor data (not packed — used in tasks, NAV, queues)
 // ============================================================
 
-// IMU — axis-aligned + int16 bias removed (by LSM6DSO32::readCalibratedIMU)
+// IMU — axis-aligned + int16 bias removed
 struct Raw_imu {
     uint32_t timestamp;
     int16_t gx, gy, gz;
     int16_t ax, ay, az;
 };
 
-// BARO — altitude (m) above pad (from BMP388::readAltitude)
+// BARO — altitude (m) above pad
 struct Raw_press {
     uint32_t timestamp;
     float alt;
-};
-
-// MAG — fully calibrated Gauss (from MMC5983MA::readCalibratedMag)
-struct Raw_mag {
-    uint32_t timestamp;
-    float mx, my, mz;
-};
-
-// GPS — NED pos/vel + accuracy + fix (from NEOM9N::getNED)
-struct Raw_gps {
-    uint32_t timestamp;
-    float pn, pe, pd;
-    float vn, ve, vd;
-    float hAcc, vAcc;
-    uint8_t fixType;
-    uint8_t numSV;
-    bool hasPos;   // true if origin set AND fix>=3
 };
 
 // SI-converted IMU state (float), used by EKF predict
@@ -54,14 +35,14 @@ struct State_imu {
     float gx, gy, gz;   // [rad/s]
 };
 
-// ES-EKF nominal state (16 floats)
+// ES-EKF nominal state (simplified for 1D, but fields kept for logging consistency)
 struct State_nominal {
     uint32_t timestamp;
-    float p[3];   // NED position [m]
-    float v[3];   // NED velocity [m/s]
-    float q[4];   // quaternion (w, x, y, z)
-    float ba[3];  // accel bias
-    float bg[3];  // gyro bias
+    float p[3];   // [0, 0, altitude]
+    float v[3];   // [0, 0, vertical_vel]
+    float q[4];   // [1, 0, 0, 0]
+    float ba[3];  // [0, 0, accel_bias]
+    float bg[3];  // [0, 0, 0]
 };
 
 // ============================================================
@@ -82,7 +63,7 @@ struct baro_pkt {
   float alt;
 };
 
-// ID 2 : IMU calibrated raw (axis-aligned + int16 bias subtracted)
+// ID 2 : IMU calibrated raw
 struct imu_pkt {
   PacketHeader header;
   uint32_t t;
@@ -90,25 +71,7 @@ struct imu_pkt {
   int16_t ax, ay, az;
 };
 
-// ID 3 : Magnetometer fully calibrated Gauss (hard+soft iron + axis)
-struct mag_pkt {
-  PacketHeader header;
-  uint32_t t;
-  float mx, my, mz;
-};
-
-// ID 4 : GPS NED from origin + velocity + accuracy + fix info
-struct gps_pkt {
-  PacketHeader header;
-  uint32_t t;
-  float pn, pe, pd;
-  float vn, ve, vd;
-  float hAcc, vAcc;
-  uint8_t fixType;
-  uint8_t numSV;
-};
-
-// ID 5 : ES-EKF nominal state
+// ID 5 : State (Simplified 1D)
 struct state_pkt {
   PacketHeader header;
   uint32_t t;
