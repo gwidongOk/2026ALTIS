@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <math.h>
+#include <ArduinoEigen.h>
 
 #include "sensor_data.h"
 #include "KF1D.h"
@@ -15,30 +16,36 @@ private:
     State_nominal _nominal   = {};
 
     KF1D _kf;
-    bool  _kf_ready = false;
+    bool _kf_ready = false;
 
-    // Time tracking for IMU dt
+    // Quaternion state: qw + qx*i + qy*j + qz*k
+    Eigen::Quaternionf _q = Eigen::Quaternionf::Identity();
+    
+    // Gravity in NED Down direction [m/s^2]
+    const Eigen::Vector3f _g_ned = Eigen::Vector3f(0.0f, 0.0f, 9.80665f);
+
     int64_t _last_imu_time_us = 0;
 
-    // LSM6DSO32 ±32g / ±2000dps sensitivities
+    // Sensitivity scales
     static constexpr float ACCEL_SCALE = 0.976f * 0.001f * 9.80665f;
     static constexpr float GYRO_SCALE  = 70.0f  * 0.001f * (M_PI / 180.0f);
 
     void syncNominal();
+    void integrateQuaternion(const Eigen::Vector3f& w, float dt);
 
 public:
     NAV();
-
-    // Sensor task callbacks
+    
+    // Task callbacks
     void updateIMU(const Raw_imu &raw);
     void updatePress(const Raw_press &p);
 
-    // ===== KF lifecycle =====
+    // Lifecycle
     bool ekfBegin();
     void ekfReset();
     bool isEkfReady() const { return _kf_ready; }
 
-    // ===== KF cycle =====
+    // Manual cycle control if needed
     void ekfPredict(float dt);
     void ekfUpdateBaro();
 
@@ -50,4 +57,3 @@ public:
 };
 
 #endif
-
