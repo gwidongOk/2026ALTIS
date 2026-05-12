@@ -14,15 +14,12 @@
 // ============================================================
 static SPIClass sensorSPI(HSPI);
 static SPIClass flashSPI(FSPI);
-
 static LSM6DSO32 imu(IMU_CS_PIN, &sensorSPI);
 static BMP388    bmp(BMP_CS_PIN, &sensorSPI);
 static MX25Logger logger;
-
 static TaskHandle_t TaskHandle_IMU  = NULL;
 static TaskHandle_t TaskHandle_BMP  = NULL;
 static TaskHandle_t FlushTaskHandle = NULL;
-
 static SemaphoreHandle_t spiMutex   = NULL;
 static SemaphoreHandle_t flashMutex = NULL;
 
@@ -190,7 +187,6 @@ void IMU_Task(void *pvParameters) {
       imu.readCalibratedIMU(raw.gx, raw.gy, raw.gz, raw.ax, raw.ay, raw.az);
       xSemaphoreGive(spiMutex);
     }
-
     if (measActive) logger.logImu(raw);
   }
 }
