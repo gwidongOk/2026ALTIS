@@ -84,34 +84,42 @@ void NAV::syncNominal() {
 }
 
 bool NAV::kfBegin() {
-    // 1. Orientation Alignment
-    // Average internal state samples (IMU_Task is already running)
+    static constexpr int ALIGN_SAMPLE_TARGET = 400;
+    static constexpr float MIN_ALIGN_ACCEL = 0.5f * 9.80665f;
+    static constexpr float MAX_ALIGN_ACCEL = 1.5f * 9.80665f;
+
+    // 1. Orientation alignment from averaged accelerometer samples.
+    // The rocket must be vertical and motionless. In this mounting, the
+    // calibrated accelerometer should read about +1 g on body X.
     Vector3f sum_a = Vector3f::Zero();
     int count = 0;
     uint32_t last_t = 0;
     
-    // Wait for 50 distinct samples (~0.12s at 400Hz, but loop 500 times max to prevent hang)
-    for (int i = 0; i < 500 && count < 50; i++) {
+    // Collect about 1 second of distinct IMU samples at 416 Hz.
+    for (int i = 0; i < 2000 && count < ALIGN_SAMPLE_TARGET; i++) {
         if (_state_imu.timestamp != last_t) {
             sum_a += Vector3f(_state_imu.ax, _state_imu.ay, _state_imu.az);
             last_t = _state_imu.timestamp;
             count++;
         }
-        vTaskDelay(pdMS_TO_TICKS(5)); 
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    if (count > 0) {
-        Vector3f avg_a = sum_a / (float)count;
-        if (avg_a.norm() > 0.1f) {
-            avg_a.normalize();
-            // Accelerometer measures -g (Upward) in body frame. Match to NED Up [0, 0, -1].
-            _q = Quaternionf::FromTwoVectors(avg_a, Vector3f(0.0f, 0.0f, -1.0f));
-        } else {
-            _q.setIdentity();
-        }
-    } else {
-        _q.setIdentity();
+    if (count < ALIGN_SAMPLE_TARGET) {
+        Serial.printf("KF align fail: only %d IMU samples\n", count);
+        return false;
     }
+
+    Vector3f avg_a = sum_a / (float)count;
+    float accel_norm = avg_a.norm();
+    if (accel_norm < MIN_ALIGN_ACCEL || accel_norm > MAX_ALIGN_ACCEL) {
+        Serial.printf("KF align fail: accel norm %.3f m/s^2\n", accel_norm);
+        return false;
+    }
+
+    avg_a /= accel_norm;
+    // Specific force points upward at rest. Map body-frame +g direction to NED Up.
+    _q = Quaternionf::FromTwoVectors(avg_a, Vector3f(0.0f, 0.0f, -1.0f));
 
     _pos_ne.setZero();
     _vel_ne.setZero();

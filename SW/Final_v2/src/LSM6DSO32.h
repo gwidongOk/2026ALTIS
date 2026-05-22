@@ -5,6 +5,18 @@
 #include <SPI.h>
 
 class LSM6DSO32 {
+public:
+    // Calibration thresholds (raw sensor axes, LSB units)
+    static constexpr float MAX_GYRO_STD_LSB  = 2.0f;
+    static constexpr float MAX_ACCEL_STD_LSB = 6.0f;
+
+    struct CalibStats {
+        float mean_g[3];  // gx, gy, gz (raw sensor axes, LSB)
+        float mean_a[3];  // ax, ay, az (raw sensor axes, LSB)
+        float std_g[3];
+        float std_a[3];
+    };
+
 private:
     uint8_t _csPin;
     SPIClass* _spi;
@@ -13,6 +25,9 @@ private:
     // int16 bias stored at RAW axis (before body-frame remap)
     int16_t _bias_gx = 0, _bias_gy = 0, _bias_gz = 0;
     int16_t _bias_ax = 0, _bias_ay = 0, _bias_az = 0;
+
+    // Stats from the most recent calibrate() call (filled before pass/fail checks)
+    CalibStats _lastStats{};
 
     static const uint8_t REG_INT1_CTRL = 0x0D;
     static const uint8_t REG_INT2_CTRL = 0x0E;
@@ -50,6 +65,10 @@ public:
     // Body-frame mapping: x = sensor_y, y = sensor_x, z = -sensor_z
     void readCalibratedIMU(int16_t &gx, int16_t &gy, int16_t &gz,
                            int16_t &ax, int16_t &ay, int16_t &az);
+
+    // Mean/std measured during the last calibrate() call (raw sensor axes).
+    // Filled even when calibrate() returns false.
+    const CalibStats& getLastCalibStats() const { return _lastStats; }
 };
 
 #endif

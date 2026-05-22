@@ -44,16 +44,18 @@ private:
     // Fixed baro noise (matched to measurement: std=0.298 m)
     const float sigma_b_sq = 0.089f;
 
-    // Baseline accel variance floor (measured at rest: std=0.025 m/s²)
+    // Baseline accel variance floor.
+    // Uses the larger of the rest measurement and LSM6DSO32 +/-32g datasheet
+    // estimate used in MATLAB validation: sigma_a ~= 0.032 m/s^2.
     // Prevents Q from collapsing to 0 in steady state.
-    const float sigma_a_base = 6.3e-4f;
+    const float sigma_a_base = 1.0e-3f;
 
     // Rolling window for real-time σ_a² estimation
     static constexpr int WIN = 20;
     float _win[WIN] = {};
     int   _win_idx  = 0;
     bool  _win_full = false;
-    float _win_var  = 6.3e-4f;   // current variance estimate
+    float _win_var  = 1.0e-3f;   // current variance estimate
 
     void pushSample(float acc_up);
     void updateVariance();

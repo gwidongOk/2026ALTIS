@@ -78,7 +78,7 @@
 #define TILT_LIMIT_DEG      45.0f   // Abort 2nd-stage ignition if tilt from vertical exceeds
 
 // SERVO_1: drogue parachute release at apogee
-#define SERVO_DROGUE_IDLE_DEG    92     // Pre-flight / armed (latched)
+#define SERVO_DROGUE_IDLE_DEG    90     // Pre-flight / armed (latched)
 #define SERVO_DROGUE_DEPLOY_DEG  0    // Apogee deploy angle
 
 #endif

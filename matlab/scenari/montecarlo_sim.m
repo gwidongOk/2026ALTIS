@@ -14,6 +14,7 @@
 clear; close all; clc;
 
 this_dir = fileparts(mfilename('fullpath'));
+addpath(this_dir);
 addpath(fullfile(this_dir, '..'));   % KF1D.m
 CSV_PATH = fullfile(this_dir, 'openrocket.csv');
 
@@ -23,19 +24,42 @@ F_BMP    = 50;           % Baro update rate [Hz]
 N_MC     = 200;          % Monte Carlo runs
 G        = 9.80665;
 g_NED    = [0; 0; G];   % gravity in NED frame (down = +Z)
+USE_KINEMATIC_2STAGE = true;
+% Realistic validation presets:
+%   baseline            : nominal flight + conservative white noise
+%   energy_uncertainty  : lower-energy/high-drag flight + sensor bias
+%   delayed_stage       : late 2nd-stage ignition + scale/misalignment error
+%   aero_tilt           : pitch/lateral disturbance + baro lag/drift
+%   stress              : harsh staging transient + combined worst-case errors
+% Use 'custom' only when directly setting KINEMATIC_CASE and DISTURBANCE_CASE.
+SCENARIO_PRESET = 'stress';
+KINEMATIC_CASE = '';      % used only when SCENARIO_PRESET = 'custom'
+DISTURBANCE_CASE = '';    % used only when SCENARIO_PRESET = 'custom'
+if ~strcmpi(SCENARIO_PRESET, 'custom')
+    [KINEMATIC_CASE, DISTURBANCE_CASE] = scenario_preset(SCENARIO_PRESET);
+end
 
 global SIGMA_A_SQ SIGMA_B_SQ
-SIGMA_A_SQ = 6.3e-4;    % per-sample accel variance [(m/s²)²]  — measured
+SIGMA_A_SQ = 1.0e-3;    % per-sample accel variance [(m/s²)²]  — LSM6DSO32 spec
 SIGMA_B_SQ = 0.089;     % per-sample baro  variance [m²]       — measured
-SIGMA_G_SQ = (0.005)^2; % per-sample gyro  variance [(rad/s)²] — LSM6DSO32 spec
+SIGMA_G_SQ = 1.2e-6; % per-sample gyro  variance [(rad/s)²] — LSM6DSO32 spec
 
 sa = sqrt(SIGMA_A_SQ);
 sb = sqrt(SIGMA_B_SQ);
 sg = sqrt(SIGMA_G_SQ);
+D = disturbance_config(DISTURBANCE_CASE);
+fprintf('Scenario preset: %s\n', SCENARIO_PRESET);
+fprintf('Kinematic case: %s\n', KINEMATIC_CASE);
+fprintf('Disturbance case: %s\n', DISTURBANCE_CASE);
 
 %% ── Load & resample ──────────────────────────────────────────────────────
-fprintf('Loading %s ...\n', CSV_PATH);
-raw = load_openrocket(CSV_PATH);
+if USE_KINEMATIC_2STAGE
+    fprintf('Loading kinematic 2-stage trajectory: %s ...\n', KINEMATIC_CASE);
+    raw = trajectory_2stage_kinematic(1 / F_IMU, KINEMATIC_CASE);
+else
+    fprintf('Loading %s ...\n', CSV_PATH);
+    raw = load_openrocket(CSV_PATH);
+end
 
 dt       = 1 / F_IMU;
 t        = (raw.t(1) : dt : raw.t(end)).';
@@ -57,6 +81,10 @@ wy   = rsp_s(raw.gy_rad);      %                   Y
 wz   = rsp_s(raw.gz_rad);      %                   Z
 
 fprintf('  Rows=%d  t_end=%.1fs  alt_max=%.1fm\n', N, t(end), max(alt));
+if isfield(raw, 'events')
+    fprintf('  Events: stage1 burnout %.2fs, stage2 ignition %.2fs, stage2 burnout %.2fs, apogee %.2fs\n', ...
+        raw.events.stage1_burnout, raw.events.stage2_ignite, raw.events.stage2_burnout, raw.events.apogee);
+end
 
 %% ── Initial attitude (matches NAV::kfBegin fromTwoVectors) ───────────────
 % body X = nosecone direction in NED, from zenith/azimuth
@@ -106,21 +134,37 @@ fprintf('  Consistency check: max |vel_integrated - vel_truth| = %.4f m/s\n', di
 fprintf('Running %d Monte Carlo runs ...\n', N_MC);
 pos_mc = zeros(N, N_MC);
 vel_mc = zeros(N, N_MC);
+rng(42);
 
 for mc = 1:N_MC
     kf    = KF1D(alt(1), vel(1));
     q_hat = q0;
 
+    accel_bias = D.accel_bias_std * randn(3,1);
+    gyro_bias  = D.gyro_bias_std  * randn(3,1);
+    accel_scale = 1.0 + D.accel_scale_std * randn(3,1);
+    gyro_scale  = 1.0 + D.gyro_scale_std  * randn(3,1);
+    C_misalign = small_angle_dcm(D.imu_misalign_std_rad * randn(3,1));
+
+    baro_bias = D.baro_bias_std * randn();
+    baro_drift_rate = D.baro_drift_std * randn() / max(t(end), 1.0);
+    baro_delay = max(0.0, D.baro_delay_s + D.baro_delay_jitter_s * randn());
+    baro_delay_samples = round(baro_delay / dt);
+    baro_lag_state = alt(1);
+
     for k = 1:N
         %──── IMU sim (matches IMU_Task → NAV::updateIMU) ────
         % 1. Noisy gyro → attitude estimate
-        w_noisy = [wx(k); wy(k); wz(k)] + sg * randn(3,1);
+        w_true = [wx(k); wy(k); wz(k)];
+        w_noisy = gyro_scale .* w_true + gyro_bias + sg * randn(3,1);
         if k > 1
             q_hat = quat_integ(q_hat, w_noisy, dt);
         end
 
         % 2. Noisy specific force in body frame
-        f_meas = f_body_true(:,k) + sa * randn(3,1);
+        f_meas = C_misalign * (accel_scale .* f_body_true(:,k)) ...
+               + accel_bias + sa * randn(3,1);
+        f_meas = min(max(f_meas, -D.accel_clip_mps2), D.accel_clip_mps2);
 
         % 3. body → NED using estimated attitude, subtract gravity
         R_hat  = quat2rot(q_hat);
@@ -132,7 +176,23 @@ for mc = 1:N_MC
             kf.predict(acc_up, dt);
         end
         if mod(k-1, bmpEvery) == 0
-            kf.update(alt(k) + sb * randn());
+            if rand() >= D.baro_dropout_prob
+                kd = max(1, k - baro_delay_samples);
+                alt_delayed = alt(kd);
+                if D.baro_lag_tau_s > 0
+                    alpha = 1.0 - exp(-(bmpEvery * dt) / D.baro_lag_tau_s);
+                    baro_lag_state = baro_lag_state + alpha * (alt_delayed - baro_lag_state);
+                    alt_baro_truth = baro_lag_state;
+                else
+                    alt_baro_truth = alt_delayed;
+                end
+
+                z_baro = alt_baro_truth + baro_bias + baro_drift_rate * t(k) + sb * randn();
+                if rand() < D.baro_outlier_prob
+                    z_baro = z_baro + D.baro_outlier_std * randn();
+                end
+                kf.update(z_baro);
+            end
         end
 
         pos_mc(k, mc) = kf.x(1);
@@ -178,6 +238,99 @@ sgtitle(sprintf( ...
 %% =====================================================================
 
 % ── Quaternion math (toolbox-free, matches NAV.cpp / Eigen) ────────────
+
+function [kinematic_case, disturbance_case] = scenario_preset(name)
+    switch lower(string(name))
+        case "baseline"
+            % Acceptance baseline: nominal flight with conservative sensor white noise.
+            kinematic_case = 'nominal_800m';
+            disturbance_case = 'white_noise';
+        case "energy_uncertainty"
+            % Motor/drag uncertainty: lower apogee profile plus sensor biases.
+            kinematic_case = 'energy_envelope';
+            disturbance_case = 'bias';
+        case "delayed_stage"
+            % Two-stage timing sensitivity: late ignition plus scale/mounting errors.
+            kinematic_case = 'delayed_ignition';
+            disturbance_case = 'scale_misalignment';
+        case "aero_tilt"
+            % Flight dynamics and pressure-port sensitivity: tilt plus baro lag/drift.
+            kinematic_case = 'aero_tilt';
+            disturbance_case = 'baro_lag_drift';
+        case "stress"
+            % Qualification-style upper bound: harsh staging plus combined errors.
+            kinematic_case = 'harsh_transient';
+            disturbance_case = 'worst_case';
+        otherwise
+            error('montecarlo_sim:UnknownScenarioPreset', ...
+                'Unknown scenario preset: %s', name);
+    end
+end
+
+function D = disturbance_config(case_name)
+    D.case_name = lower(string(case_name));
+
+    D.accel_bias_std = 0.0;
+    D.gyro_bias_std = 0.0;
+    D.accel_scale_std = 0.0;
+    D.gyro_scale_std = 0.0;
+    D.imu_misalign_std_rad = 0.0;
+    D.accel_clip_mps2 = 32.0 * 9.80665;
+
+    D.baro_bias_std = 0.0;
+    D.baro_drift_std = 0.0;
+    D.baro_delay_s = 0.0;
+    D.baro_delay_jitter_s = 0.0;
+    D.baro_lag_tau_s = 0.0;
+    D.baro_dropout_prob = 0.0;
+    D.baro_outlier_prob = 0.0;
+    D.baro_outlier_std = 0.0;
+
+    switch D.case_name
+        case {"white_noise", "nominal"}
+        case "bias"
+            D.accel_bias_std = 0.05;
+            D.gyro_bias_std = 0.003;
+            D.baro_bias_std = 1.0;
+            D.baro_drift_std = 0.8;
+        case "scale_misalignment"
+            D.accel_scale_std = 0.010;
+            D.gyro_scale_std = 0.005;
+            D.imu_misalign_std_rad = deg2rad(1.0);
+        case "baro_lag_drift"
+            D.baro_bias_std = 1.0;
+            D.baro_drift_std = 2.0;
+            D.baro_delay_s = 0.080;
+            D.baro_delay_jitter_s = 0.020;
+            D.baro_lag_tau_s = 0.060;
+            D.baro_outlier_prob = 0.003;
+            D.baro_outlier_std = 4.0;
+        case "worst_case"
+            D.accel_bias_std = 0.06;
+            D.gyro_bias_std = 0.004;
+            D.accel_scale_std = 0.012;
+            D.gyro_scale_std = 0.006;
+            D.imu_misalign_std_rad = deg2rad(1.2);
+            D.baro_bias_std = 1.5;
+            D.baro_drift_std = 2.5;
+            D.baro_delay_s = 0.100;
+            D.baro_delay_jitter_s = 0.030;
+            D.baro_lag_tau_s = 0.080;
+            D.baro_dropout_prob = 0.005;
+            D.baro_outlier_prob = 0.005;
+            D.baro_outlier_std = 5.0;
+        otherwise
+            error('montecarlo_sim:UnknownDisturbanceCase', ...
+                'Unknown disturbance case: %s', case_name);
+    end
+end
+
+function C = small_angle_dcm(theta)
+    S = [ 0.0,      -theta(3),  theta(2);
+          theta(3),  0.0,      -theta(1);
+         -theta(2),  theta(1),  0.0 ];
+    C = eye(3) + S;
+end
 
 function q = quat_integ(q, w, dt)
     % Matches NAV::integrateQuaternion()
@@ -297,8 +450,11 @@ function plot_traj(t, truth, est, sigma3)
 end
 
 function plot_err(t, err, sigma3)
+    err_mean = mean(err, 2);
     hold on; grid on;
-    plot(t, err,      'Color', [0.85 0.85 0.85]);
-    plot(t, +sigma3, 'r', 'LineWidth', 1.3);
-    plot(t, -sigma3, 'r', 'LineWidth', 1.3);
+    plot(t, err, 'Color', [0.85 0.85 0.85], 'HandleVisibility', 'off');
+    plot(t, err_mean, 'b--', 'LineWidth', 1.2, 'DisplayName', 'Mean error');
+    plot(t, err_mean + sigma3, 'r', 'LineWidth', 1.3, 'DisplayName', 'Mean \pm3\sigma');
+    plot(t, err_mean - sigma3, 'r', 'LineWidth', 1.3, 'HandleVisibility', 'off');
+    legend('Location', 'best');
 end

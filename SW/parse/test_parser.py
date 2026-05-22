@@ -17,7 +17,8 @@ sys.path.insert(0, HERE)
 from header_parser import parse_header
 
 # -- Init parser --
-STRUCTS     = parse_header(os.path.join(HERE, 'sensor_data.h'))
+HEADER_PATH = os.path.join(HERE, 'sensor_data.h')
+STRUCTS     = parse_header(HEADER_PATH)
 EXPECTED_SZ = {sd.pkt_id: sd.size for sd in STRUCTS.values()}
 KNOWN_IDS   = set(EXPECTED_SZ)
 SYNC        = 0xAA
@@ -104,8 +105,8 @@ def make_full_dump():
     dump += make_state(200000, 0, 0, -50, 0, 0, -10, 1, 0, 0, 0)
     dump += make_event(300000, 1, 1)             # LAUNCH
     dump += make_event(310000, 2, 2)             # BO
-    dump += make_event(320000, 2, 3)             # APOGEE
-    dump += make_event(330000, 3, 4)             # LAND
+    dump += make_event(320000, 3, 3)             # APOGEE / DESCENT
+    dump += make_event(330000, 4, 4)             # LAND / LANDED
     dump += b'\xFF\xFF\xFF\xFF'
     return dump
 
@@ -113,6 +114,7 @@ def make_full_dump():
 print('=' * 56)
 print(' 2026ALTIS parser unit test')
 print('=' * 56)
+print(f' header: {HEADER_PATH}')
 
 all_pass = True
 

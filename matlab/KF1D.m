@@ -32,11 +32,10 @@ classdef KF1D < handle
         win_count  % number of valid samples so far
         win_var    % current σ_a² estimate
     end
-
     methods
         function obj = KF1D(p0, v0)
             global SIGMA_A_SQ SIGMA_B_SQ
-            if isempty(SIGMA_A_SQ), SIGMA_A_SQ = 6.3e-4; end
+            if isempty(SIGMA_A_SQ), SIGMA_A_SQ = 1.0e-3; end
             if isempty(SIGMA_B_SQ), SIGMA_B_SQ = 0.089;  end
             if nargin < 1, p0 = 0; end
             if nargin < 2, v0 = 0; end

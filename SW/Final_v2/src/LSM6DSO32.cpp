@@ -1,4 +1,5 @@
 #include "LSM6DSO32.h"
+#include <math.h>
 
 LSM6DSO32::LSM6DSO32(uint8_t csPin, SPIClass* spi) {
     _csPin = csPin;
@@ -12,7 +13,7 @@ bool LSM6DSO32::begin() {
 
     uint8_t whoAmI = readRegister(REG_WHO_AM_I);
     if (whoAmI != 0x6C) {
-        Serial.printf("LSM6DSO32 에러! WHO_AM_I = 0x%02X\n", whoAmI);
+        Serial.printf("LSM6DSO32 error! WHO_AM_I = 0x%02X\n", whoAmI);
         return false;
     }
 
@@ -21,11 +22,11 @@ bool LSM6DSO32::begin() {
     writeRegister(REG_CTRL3_C, 0x44);
     writeRegister(REG_CTRL4_C, 0x04);
 
-    // 416Hz ODR, ±32g, ±2000dps
+    // 416 Hz ODR, +/-32 g, +/-2000 dps.
     writeRegister(REG_CTRL1_XL, 0x64);
     writeRegister(REG_CTRL2_G,  0x6C);
 
-    // Accel LPF2 on, HPCF_XL = 001 → cutoff = ODR/10 = 41.6 Hz
+    // Accel LPF2 on, HPCF_XL = 001, cutoff = ODR/10 = 41.6 Hz.
     uint8_t ctrl1 = readRegister(REG_CTRL1_XL);
     writeRegister(REG_CTRL1_XL, ctrl1 | 0x02);
     uint8_t ctrl8 = readRegister(REG_CTRL8_XL);
@@ -33,7 +34,7 @@ bool LSM6DSO32::begin() {
     ctrl8 |= (0x01 << 5);
     writeRegister(REG_CTRL8_XL, ctrl8);
 
-    // Gyro LPF1 on, FTYPE = 000 → cutoff = 136.6 Hz
+    // Gyro LPF1 on, FTYPE = 000, cutoff = 136.6 Hz.
     uint8_t ctrl4 = readRegister(REG_CTRL4_C);
     writeRegister(REG_CTRL4_C, ctrl4 | 0x02);
     uint8_t ctrl6 = readRegister(REG_CTRL6_C);
@@ -44,39 +45,64 @@ bool LSM6DSO32::begin() {
 }
 
 bool LSM6DSO32::calibrate(uint16_t nSamples) {
-    int32_t s_gx = 0, s_gy = 0, s_gz = 0, s_ax = 0, s_ay = 0, s_az = 0;
+    static constexpr int16_t ONE_G_LSB = 1025; // 1 g at +/-32 g, 0.976 mg/LSB.
 
-    // [STEP 1] 평균값으로 Bias 설정
+    int32_t s_gx = 0, s_gy = 0, s_gz = 0, s_ax = 0, s_ay = 0, s_az = 0;
+    int64_t ss_gx = 0, ss_gy = 0, ss_gz = 0, ss_ax = 0, ss_ay = 0, ss_az = 0;
+
+    // Collect raw samples while the rocket is vertical and motionless.
     for (uint16_t i = 0; i < nSamples; i++) {
         int16_t gx, gy, gz, ax, ay, az;
         readRawIMU(gx, gy, gz, ax, ay, az);
+
         s_gx += gx; s_gy += gy; s_gz += gz;
         s_ax += ax; s_ay += ay; s_az += az;
+
+        ss_gx += (int32_t)gx * gx;
+        ss_gy += (int32_t)gy * gy;
+        ss_gz += (int32_t)gz * gz;
+        ss_ax += (int32_t)ax * ax;
+        ss_ay += (int32_t)ay * ay;
+        ss_az += (int32_t)az * az;
+
         vTaskDelay(pdMS_TO_TICKS(3));
     }
 
-    _bias_gx = (int16_t)(s_gx / nSamples);
-    _bias_gy = (int16_t)(s_gy / nSamples);
-    _bias_gz = (int16_t)(s_gz / nSamples);
-    _bias_ax = (int16_t)(s_ax / nSamples);
-    _bias_ay = (int16_t)(s_ay / nSamples);
-    _bias_az = (int16_t)(s_az / nSamples);
+    float inv_n = 1.0f / (float)nSamples;
+    float mean_gx = (float)s_gx * inv_n;
+    float mean_gy = (float)s_gy * inv_n;
+    float mean_gz = (float)s_gz * inv_n;
+    float mean_ax = (float)s_ax * inv_n;
+    float mean_ay = (float)s_ay * inv_n;
+    float mean_az = (float)s_az * inv_n;
 
-    // [STEP 2] 영점 수렴도 확인
-    s_gx = 0; s_ay = 0; // 대표 축 2개만 초기화해서 확인
-    for (uint16_t i = 0; i < nSamples; i++) {
-        int16_t gx, gy, gz, ax, ay, az;
-        readRawIMU(gx, gy, gz, ax, ay, az);
-        s_gx += (gx - _bias_gx);
-        s_ay += (ay - _bias_ay);
-        vTaskDelay(pdMS_TO_TICKS(3));
-    }
-    // 최종 검증 (평균 편차가 기준치 이내인가)
-    if (abs((double)s_gx / nSamples) > 1.5 || abs((double)s_ay / nSamples) > 3.0) {
+    float std_gx = sqrtf(fmaxf(0.0f, (float)ss_gx * inv_n - mean_gx * mean_gx));
+    float std_gy = sqrtf(fmaxf(0.0f, (float)ss_gy * inv_n - mean_gy * mean_gy));
+    float std_gz = sqrtf(fmaxf(0.0f, (float)ss_gz * inv_n - mean_gz * mean_gz));
+    float std_ax = sqrtf(fmaxf(0.0f, (float)ss_ax * inv_n - mean_ax * mean_ax));
+    float std_ay = sqrtf(fmaxf(0.0f, (float)ss_ay * inv_n - mean_ay * mean_ay));
+    float std_az = sqrtf(fmaxf(0.0f, (float)ss_az * inv_n - mean_az * mean_az));
+
+    // Publish stats before checks so callers can read them on failure too.
+    _lastStats.mean_g[0] = mean_gx; _lastStats.mean_g[1] = mean_gy; _lastStats.mean_g[2] = mean_gz;
+    _lastStats.mean_a[0] = mean_ax; _lastStats.mean_a[1] = mean_ay; _lastStats.mean_a[2] = mean_az;
+    _lastStats.std_g[0]  = std_gx;  _lastStats.std_g[1]  = std_gy;  _lastStats.std_g[2]  = std_gz;
+    _lastStats.std_a[0]  = std_ax;  _lastStats.std_a[1]  = std_ay;  _lastStats.std_a[2]  = std_az;
+
+    if (std_gx > MAX_GYRO_STD_LSB || std_gy > MAX_GYRO_STD_LSB || std_gz > MAX_GYRO_STD_LSB ||
+        std_ax > MAX_ACCEL_STD_LSB || std_ay > MAX_ACCEL_STD_LSB || std_az > MAX_ACCEL_STD_LSB) {
         return false;
     }
-    // [STEP 3] 중력 가속도 오프셋 적용
-    _bias_ay -= 1025; 
+
+    _bias_gx = (int16_t)roundf(mean_gx);
+    _bias_gy = (int16_t)roundf(mean_gy);
+    _bias_gz = (int16_t)roundf(mean_gz);
+    _bias_ax = (int16_t)roundf(mean_ax);
+    _bias_ay = (int16_t)roundf(mean_ay);
+    _bias_az = (int16_t)roundf(mean_az);
+
+    // Keep +1 g on sensor Y, which maps to body X while the rocket is vertical.
+    _bias_ay -= ONE_G_LSB;
     return true;
 }
 
@@ -107,25 +133,16 @@ void LSM6DSO32::readCalibratedIMU(int16_t &gx, int16_t &gy, int16_t &gz,
     int16_t rgx, rgy, rgz, rax, ray, raz;
     readRawIMU(rgx, rgy, rgz, rax, ray, raz);
 
-    // 1. Zero-g 바이어스 제거 (순수 센서 좌표계)
     rgx -= _bias_gx; rgy -= _bias_gy; rgz -= _bias_gz;
     rax -= _bias_ax; ray -= _bias_ay; raz -= _bias_az;
 
-    // 2. 로켓 기체 좌표계(Body Frame)로 정렬
-    // Body X = Sensor Y (Nosecone 방향)
-    // Body Y = Sensor X (Right 방향)
-    // Body Z = -Sensor Z (Down 방향)
-    
-    // 자이로 변환
-    gx =  rgy; 
-    gy =  rgx; 
+    // Body X = Sensor Y (nose direction), Body Y = Sensor X, Body Z = -Sensor Z.
+    gx =  rgy;
+    gy =  rgx;
     gz = -rgz;
 
-    // 가속도 변환
-    // 정지 상태(Stand-up): Body X(Nosecone)가 하늘을 향하면 ray가 +1g가 되어 ax = +1g가 됨.
-    // 정지 상태(Horizontal): Body Z(Down)가 땅을 향하면 raz가 -1g(Sensor Z=Up이므로)가 되어 az = +1g가 됨.
-    ax =  ray; 
-    ay =  rax; 
+    ax =  ray;
+    ay =  rax;
     az = -raz;
 }
 

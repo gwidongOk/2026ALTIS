@@ -158,6 +158,21 @@ void loop() {
         xSemaphoreGive(spiMutex);
         clearSensors();
 
+        // Report IMU stats (measured vs threshold) over BLE so the operator
+        // can see why a calibration attempt fails.
+        const LSM6DSO32::CalibStats& cs = imu.getLastCalibStats();
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "GYRO STD: %.2f %.2f %.2f (lim %.1f)\n",
+                 cs.std_g[0], cs.std_g[1], cs.std_g[2],
+                 LSM6DSO32::MAX_GYRO_STD_LSB);
+        sendResponse(buf);
+        snprintf(buf, sizeof(buf),
+                 "ACCEL STD: %.2f %.2f %.2f (lim %.1f)\n",
+                 cs.std_a[0], cs.std_a[1], cs.std_a[2],
+                 LSM6DSO32::MAX_ACCEL_STD_LSB);
+        sendResponse(buf);
+
         if (imuOk && bmpOk) {
           sendResponse("CALIBRATION DONE.\n");
           beep(200);
@@ -196,22 +211,22 @@ void loop() {
     }
     else if (cmd == "TEST PYRO1") {
       // !! e-match must be DISCONNECTED before running this !!
-      sendResponse("PYRO1: 100ms pulse (e-match disconnected?)\n");
+      sendResponse("PYRO1: 1000ms pulse (e-match disconnected?)\n");
       beep(50, 3);                             // triple-beep warning
       vTaskDelay(pdMS_TO_TICKS(1000));         // 1s delay for operator to stand clear
       digitalWrite(PYRO_1_PIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(100));
+      vTaskDelay(pdMS_TO_TICKS(STAGE2_PULSE_MS));
       digitalWrite(PYRO_1_PIN, LOW);
       sendResponse("PYRO1 DONE\n");
       beep(200);
     }
     else if (cmd == "TEST PYRO2") {
       // !! e-match must be DISCONNECTED before running this !!
-      sendResponse("PYRO2: 100ms pulse (e-match disconnected?)\n");
+      sendResponse("PYRO2: 1000ms pulse (e-match disconnected?)\n");
       beep(50, 3);
       vTaskDelay(pdMS_TO_TICKS(1000));
       digitalWrite(PYRO_2_PIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(100));
+      vTaskDelay(pdMS_TO_TICKS(MAIN_PULSE_MS));
       digitalWrite(PYRO_2_PIN, LOW);
       sendResponse("PYRO2 DONE\n");
       beep(200);
@@ -219,9 +234,21 @@ void loop() {
 
     else if (cmd == "START") {
       sendResponse("STARTING...\n");
-      // kfBegin polls _state_imu for ~250ms; do NOT hold navMutex during
-      // the loop or IMU_Task gets starved and only 1 sample is collected.
-      nav.kfBegin();
+      // kfBegin polls _state_imu for about 1s; do NOT hold navMutex during
+      // the loop or IMU_Task gets starved and alignment cannot collect samples.
+      while (!nav.kfBegin()) {
+        sendResponse("KF ALIGN RETRY\n");
+        beep(100, 3);
+
+        String c2 = getIncomingRaw();
+        c2.toUpperCase();
+        if (c2 == "REBOOT") {
+          sendResponse("START ABORTED - REBOOTING...\n");
+          vTaskDelay(pdMS_TO_TICKS(200));
+          ESP.restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+      }
       sendResponse("KF READY\n");
 
       clearSensors();
@@ -336,8 +363,8 @@ void Flight_Task(void *pvParameters) {
 
         case COASTING: {
           if (!stage2_attempted) {
-            sep_count = (digitalRead(STAGE_IR_PIN) == HIGH) ? sep_count + 1 : 0;
-            if (sep_count >= 3) {
+            sep_count = (digitalRead(STAGE_IR_PIN) == HIGH) ? sep_count + 1 : 0; //단분리 인지 0.5초후
+            if (sep_count >= 5) {
               // Tilt check via quaternion (no gimbal lock):
               // cos(tilt) = -R[2][0] = 2*(qw*qy - qx*qz)
               // 1 = vertical, 0 = horizontal, -1 = inverted
