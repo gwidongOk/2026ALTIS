@@ -129,6 +129,7 @@ class App(tk.Tk):
         ttk.Separator(frm, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Button(frm, text="PARSE (Dump)", command=self.send_dump).pack(side=tk.LEFT, padx=2)
+        ttk.Button(frm, text="Load BIN",     command=self.load_bin).pack(side=tk.LEFT, padx=2)
         ttk.Button(frm, text="Save BIN",     command=self.save_bin).pack(side=tk.LEFT, padx=2)
         ttk.Button(frm, text="Save XLSX",    command=self.save_xlsx).pack(side=tk.LEFT, padx=2)
 
@@ -187,10 +188,10 @@ class App(tk.Tk):
 
         self.after(100, self._update_ui_loop)
 
-    def _insert_row(self, pkt_id, decoded):
+    def _insert_row(self, pkt_id, decoded, force_display=False):
         self.all_rows.append((pkt_id, decoded))
         # 10개마다 1개씩 표시 (대량 데이터 성능 보호)
-        if len(self.all_rows) % 10 == 0:
+        if force_display or len(self.all_rows) % 10 == 0:
             sd = STRUCTS.get(pkt_id)
             type_str    = sd.name if sd else "UNK"
             display_val = ", ".join(f"{k}:{v}" for k, v in list(decoded.items())[:4])
@@ -256,6 +257,51 @@ class App(tk.Tk):
     # ─────────────────────────────────────────────
     # 저장
     # ─────────────────────────────────────────────
+    def load_bin(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Binary", "*.bin"), ("All", "*.*")])
+        if not path:
+            return
+
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            messagebox.showerror("Load failed", f"Binary 파일을 열 수 없습니다:\n{e}")
+            return
+
+        self.raw_bytes = bytearray(data)
+        self.all_rows.clear()
+        self.tree.delete(*self.tree.get_children())
+
+        buf = bytearray(data)
+        decoded_count = 0
+        decode_errors = 0
+        for pkt_id, raw in parse_buffer(buf):
+            sd = STRUCTS.get(pkt_id)
+            if not sd:
+                continue
+            try:
+                decoded = sd.decode(raw)
+            except Exception:
+                decode_errors += 1
+                continue
+            decoded_count += 1
+            self._insert_row(pkt_id, decoded, force_display=(decoded_count <= 200))
+
+        skipped = len(buf)
+        self._append_log(
+            f"[Load BIN] {os.path.basename(path)}: "
+            f"{decoded_count} packets, {decode_errors} decode errors, {skipped} trailing bytes"
+        )
+        messagebox.showinfo(
+            "Load BIN",
+            f"Binary 로드 완료\n"
+            f"패킷: {decoded_count}\n"
+            f"디코드 오류: {decode_errors}\n"
+            f"남은 바이트: {skipped}"
+        )
+
     def save_bin(self):
         if not self.raw_bytes:
             messagebox.showinfo("Empty", "저장할 데이터가 없습니다.")
