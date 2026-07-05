@@ -32,9 +32,42 @@ static TaskHandle_t FlushTaskHandle  = NULL;
 static SemaphoreHandle_t spiMutex   = NULL;
 static SemaphoreHandle_t navMutex   = NULL;
 static SemaphoreHandle_t flashMutex = NULL;
+// Serializes the four launch/disarm state-transition functions
+// (beginLaunchVerification/confirmLaunch/rejectFalseLaunch/disarmSystem) so
+// a DISARM from loop() (core 0) can never interleave with a launch decision
+// made by IMU_Task (core 1) on systemMode/flightActive/nav/logger/preTrigger.
+static SemaphoreHandle_t stateMutex = NULL;
 
 static volatile bool flightActive = false;
+static bool calibrationDone = false;
+static bool flashErasedThisBoot = false;
 static FlightPhase flightPhase = PRE_FLIGHT;
+
+enum class SystemMode : uint8_t {
+  IDLE = 0,
+  READY_CONVERGING,
+  ARMED,
+  LAUNCH_VERIFY,
+  LAUNCH_COMMIT,
+  FLIGHT,
+  LANDED
+};
+
+static volatile SystemMode systemMode = SystemMode::IDLE;
+static portMUX_TYPE modeMux = portMUX_INITIALIZER_UNLOCKED;
+static PreTriggerBuffer preTrigger;
+
+struct LaunchDetectorState {
+  bool candidate = false;
+  uint32_t firstTimestampUs = 0;
+  uint32_t lastTimestampUs = 0;
+  uint32_t candidateStartMs = 0;
+  uint32_t belowResetStartMs = 0;
+  float deltaV = 0.0f;
+};
+
+static LaunchDetectorState launchDetector;
+static volatile uint32_t launchStartMs = 0;
 
 // Forward Declarations
 void IMU_Task(void *pvParameters);
@@ -45,6 +78,14 @@ void beep(int ms, int count = 1);
 void clearSensors();
 void attachSensorInterrupts();
 void detachSensorInterrupts();
+SystemMode getSystemMode();
+void setSystemMode(SystemMode mode);
+void resetLaunchDetector();
+bool updateLaunchDetector(const Raw_imu &raw);
+void beginLaunchVerification(const Raw_imu &raw);
+void confirmLaunch();
+void rejectFalseLaunch(uint32_t timestamp);
+void disarmSystem();
 
 // ============================================================
 // setup() : Initialization
@@ -65,16 +106,29 @@ void setup() {
   servoDrogue.attach(SERVO_1_PIN);
   servoDrogue.write(SERVO_DROGUE_IDLE_DEG);
 
-  // FC-51 IR sensor for stage separation detection
-  //   PULLDOWN: if sensor unpowered/disconnected, pin reads LOW = "not separated"
-  //             → fails safe (no false ignition)
-  pinMode(STAGE_IR_PIN, INPUT_PULLDOWN);
+  // Hall sensor for stage separation detection (open-drain, active-low,
+  // external 4.7k pull-up already on the board — do NOT add an internal
+  // pull here, it would fight the external one).
+  //   KNOWN GAP: with the magnet mounted so separation moves it AWAY from
+  //   the sensor (current build), "separated" and "sensor
+  //   disconnected/unpowered" both read HIGH and are indistinguishable in
+  //   software. Fix is mechanical: remount the magnet so separation brings
+  //   it INTO range instead (LOW = separated), so any failure defaults to
+  //   the safe "not separated" reading. Until that remount happens, this
+  //   pin cannot fail safe against a disconnected sensor.
+  pinMode(STAGE_SEP_PIN, INPUT);
 
   // 2. Synchronizations
   spiMutex   = xSemaphoreCreateMutex();
   navMutex   = xSemaphoreCreateMutex();
   flashMutex = xSemaphoreCreateMutex();
-  if (!spiMutex || !navMutex || !flashMutex) {
+  stateMutex = xSemaphoreCreateMutex();
+  if (!spiMutex || !navMutex || !flashMutex || !stateMutex) {
+    beep(100, 3);
+    while (1);
+  }
+  if (!preTrigger.begin(PRETRIGGER_RECORD_CAPACITY)) {
+    sendResponse("PRETRIGGER PSRAM FAIL\n");
     beep(100, 3);
     while (1);
   }
@@ -92,7 +146,12 @@ void setup() {
   sendResponse("IMU+BARO OK\n");
 
   // 5. Storage
-  logger.begin(&flashSPI, FLASH_SCK_PIN, FLASH_MISO_PIN, FLASH_MOSI_PIN, FLASH_CS_PIN, flashMutex);
+  if (!logger.begin(&flashSPI, FLASH_SCK_PIN, FLASH_MISO_PIN,
+                    FLASH_MOSI_PIN, FLASH_CS_PIN, flashMutex)) {
+    sendResponse("LOGGER INIT FAIL\n");
+    beep(100, 3);
+    while (1);
+  }
 
   // 6. Interrupts (Always active to keep NAV updated)
   pinMode(IMU_INT1_PIN, INPUT_PULLDOWN);
@@ -117,9 +176,12 @@ void loop() {
   String cmd = getIncomingRaw();
   if (cmd.length() == 0) { vTaskDelay(pdMS_TO_TICKS(50)); return; }
   cmd.toUpperCase();
+  SystemMode mode = getSystemMode();
 
   // --- Common Commands ---
   if (cmd == "REBOOT") {
+    digitalWrite(PYRO_1_PIN, LOW);
+    digitalWrite(PYRO_2_PIN, LOW);
     sendResponse("REBOOTING...\n");
     if (logger.isEnabled()) {
       logger.setEnabled(false);
@@ -131,30 +193,62 @@ void loop() {
   }
 
   else if (cmd == "PARSE") {
-    // PARSE works in any state (pre-flight, in-flight, after STOP).
-    bool wasLogging = logger.isEnabled();
-    if (wasLogging) {
+    if (mode != SystemMode::IDLE && mode != SystemMode::LANDED) {
+      sendResponse("PARSE BLOCKED - DISARM OR LAND FIRST\n");
+    } else {
+      sendResponse("DUMP START\n");
+      logger.forceFlushBuffer();
+      logger.dumpRawBinary(Serial);
+      sendResponse("DUMP DONE\n");
+    }
+  }
+
+  else if (cmd == "DISARM") {
+    disarmSystem();
+  }
+
+  else if (cmd == "STOP") {
+    digitalWrite(PYRO_1_PIN, LOW);
+    digitalWrite(PYRO_2_PIN, LOW);
+    if (logger.isEnabled()) {
       logger.setEnabled(false);
       vTaskDelay(pdMS_TO_TICKS(100));
+      logger.forceFlushBuffer();
     }
-    sendResponse("DUMP START\n");
-    logger.forceFlushBuffer();
-    logger.dumpRawBinary(Serial);
-    sendResponse("DUMP DONE\n");
-    if (wasLogging) { flightActive = false; }
+    flightActive = false;
+    setSystemMode(SystemMode::LANDED);
+    beep(200); vTaskDelay(pdMS_TO_TICKS(50)); beep(200);
+    sendResponse("STOPPED.\n");
   }
 
   // --- Pre-Flight Commands ---
   else if (!flightActive) {
-    if (cmd == "CALIBRATE") {
-      bool imuOk = false, bmpOk = false;
-      while (!(imuOk && bmpOk)) {
-        sendResponse("CALIBRATING IMU+BMP...\n");
-        // Hold spiMutex for the full calibration: imu/bmp.calibrate() read SPI
-        // directly without locking, and would race with IMU_Task/BMP_Task.
+    bool armSequenceActive =
+        mode == SystemMode::READY_CONVERGING ||
+        mode == SystemMode::ARMED ||
+        mode == SystemMode::LAUNCH_VERIFY ||
+        mode == SystemMode::LAUNCH_COMMIT;
+
+    if (armSequenceActive) {
+      if (cmd == "READY") {
+        char status[128];
+        snprintf(status, sizeof(status), "READY MODE %u\n", (unsigned)mode);
+        sendResponse(status);
+      } else {
+        sendResponse("READY ACTIVE - ONLY DISARM OR REBOOT\n");
+      }
+    }
+    else if (cmd == "CALIBRATE") {
+      bool imuOk = false;
+      calibrationDone = false;
+      while (!imuOk) {
+        sendResponse("IMU WARMUP (5s)...\n");
+        vTaskDelay(pdMS_TO_TICKS(IMU_CALIB_WARMUP_MS));
+        sendResponse("CALIBRATING IMU (10s)...\n");
+        // The vehicle is in the known 90-degree vertical pose. This is the
+        // only stage that estimates accelerometer bias.
         xSemaphoreTake(spiMutex, portMAX_DELAY);
-        imuOk = imu.calibrate(CALIB_SAMPLES);
-        bmpOk = bmp.calibrate(CALIB_SAMPLES);
+        imuOk = imu.calibrate(IMU_CALIB_SAMPLES);
         xSemaphoreGive(spiMutex);
         clearSensors();
 
@@ -173,12 +267,12 @@ void loop() {
                  LSM6DSO32::MAX_ACCEL_STD_LSB);
         sendResponse(buf);
 
-        if (imuOk && bmpOk) {
+        if (imuOk) {
+          calibrationDone = true;
           sendResponse("CALIBRATION DONE.\n");
           beep(200);
         } else {
-          if (!imuOk) sendResponse("IMU NOISY - RETRYING...\n");
-          if (!bmpOk) sendResponse("BARO UNSTABLE - RETRYING...\n");
+          sendResponse("IMU NOISY - RETRYING...\n");
           beep(100, 3);
 
           // Allow REBOOT to abort the retry loop
@@ -196,6 +290,7 @@ void loop() {
     else if (cmd == "ERASE") {
       sendResponse("ERASING FLASH...\n");
       logger.eraseAll();
+      flashErasedThisBoot = true;
       sendResponse("DONE.\n");
       beep(500);
     }
@@ -232,8 +327,28 @@ void loop() {
       beep(200);
     }
 
-    else if (cmd == "START") {
-      sendResponse("STARTING...\n");
+    else if (cmd == "READY") {
+      if (!calibrationDone) {
+        sendResponse("CALIBRATE REQUIRED\n");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+      }
+      if (!flashErasedThisBoot) {
+        sendResponse("ERASE REQUIRED\n");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+      }
+      // With the magnet mounted so separation moves it away from the
+      // sensor, the joined/nominal state reads LOW. HIGH here means either
+      // already separated or the sensor/wiring is dead — neither should be
+      // armed. (Only checked at this instant; does not cover a failure
+      // that happens later during the READY/ARMED hold or in flight.)
+      if (digitalRead(STAGE_SEP_PIN) == HIGH) {
+        sendResponse("STAGE SEP SENSOR NOT LOW - CHECK WIRING/MAGNET\n");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+      }
+      sendResponse("READY ALIGNING...\n");
       // kfBegin polls _state_imu for about 1s; do NOT hold navMutex during
       // the loop or IMU_Task gets starved and alignment cannot collect samples.
       while (!nav.kfBegin()) {
@@ -243,38 +358,54 @@ void loop() {
         String c2 = getIncomingRaw();
         c2.toUpperCase();
         if (c2 == "REBOOT") {
-          sendResponse("START ABORTED - REBOOTING...\n");
+          sendResponse("READY ABORTED - REBOOTING...\n");
           vTaskDelay(pdMS_TO_TICKS(200));
           ESP.restart();
         }
         vTaskDelay(pdMS_TO_TICKS(500));
       }
-      sendResponse("KF READY\n");
 
-      clearSensors();
-      logger.setEnabled(true);
-      flightActive = true;
-      clearSensors();
-      beep(300);
-      sendResponse("FLIGHT ACTIVE\n");
-      xTaskNotifyGive(FlightTaskHandle);
-    }
-  }
+      // The initial attitude is now fixed at the actual launch-rail angle.
+      // Re-zero barometric altitude in this final pre-launch pose.
+      bool baroOk = false;
+      Raw_press zeroPress = {};
+      while (!baroOk) {
+        sendResponse("READY BARO ZEROING...\n");
+        xSemaphoreTake(spiMutex, portMAX_DELAY);
+        baroOk = bmp.calibrate(BARO_ZERO_SAMPLES);
+        if (baroOk) {
+          zeroPress.timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+          baroOk = bmp.readAltitude(zeroPress.alt);
+          if (baroOk) bmp.startReferenceTracking(READY_BARO_REF_TAU_S);
+        }
+        xSemaphoreGive(spiMutex);
 
-  // --- Flight/Active Commands ---
-  else {
-    if (cmd == "STOP") {
-      if (logger.isEnabled()) {
-        logger.setEnabled(false);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        logger.forceFlushBuffer();
+        if (!baroOk) {
+          sendResponse("BARO UNSTABLE - RETRYING...\n");
+          beep(100, 3);
 
-        flightActive = false;
-        beep(200); vTaskDelay(pdMS_TO_TICKS(50)); beep(200);
-        sendResponse("STOPPED.\n");
+          String c2 = getIncomingRaw();
+          c2.toUpperCase();
+          if (c2 == "REBOOT") {
+            sendResponse("READY ABORTED - REBOOTING...\n");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            ESP.restart();
+          }
+          vTaskDelay(pdMS_TO_TICKS(1000));
+        }
       }
+
+      xSemaphoreTake(navMutex, portMAX_DELAY);
+      nav.updatePress(zeroPress);
+      nav.beginZupt();
+      xSemaphoreGive(navMutex);
+      preTrigger.clear();
+      resetLaunchDetector();
+      setSystemMode(SystemMode::READY_CONVERGING);
+      beep(200, 2);
+      sendResponse("READY CONVERGING - WAIT FOR ARMED\n");
     }
-    // PARSE handled in common commands above (works regardless of flightActive)
+
   }
 
   vTaskDelay(pdMS_TO_TICKS(50));
@@ -291,21 +422,25 @@ void Flight_Task(void *pvParameters) {
   static bool     stage2_attempted = false;
   static bool     drogue_deployed  = false;
   static bool     main_deployed    = false;
+  static uint32_t powered_start_ms = 0;
 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     // Reset per-flight state
-    flightPhase      = PRE_FLIGHT;
+    flightPhase      = POWERED_FLIGHT;
     pyro1_active     = false;
     pyro2_active     = false;
     stage2_attempted = false;
     drogue_deployed  = false;
     main_deployed    = false;
-    uint8_t launch_count = 0;
+    powered_start_ms = launchStartMs;
     uint8_t descent_count = 0;
     uint8_t landed_count  = 0;
     uint8_t sep_count     = 0;
+
+    logger.logEvent(flightPhase, 1);
+    sendResponse("LAUNCH CONFIRMED\n");
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -340,53 +475,44 @@ void Flight_Task(void *pvParameters) {
 
       switch (flightPhase) {
         case PRE_FLIGHT:
-          // Debounced: 3 consecutive samples @ 10Hz = 300 ms above threshold
-          if (alt > 5.0f || vel_up > 5.0f) {
-            if (launch_count == 0) {
-              xSemaphoreTake(navMutex, portMAX_DELAY);
-              nav.resetHorizontalAndAttitudeToReference();
-              xSemaphoreGive(navMutex);
-            }
-
-            if (++launch_count >= 3) {
-              flightPhase = POWERED_FLIGHT;
-              logger.logEvent(flightPhase, 1);
-              sendResponse("LAUNCH\n");
-              launch_count = 0;
-            }
-          } else {
-            launch_count = 0;
-          }
+          // Launch detection is completed before this task is notified.
           break;
 
-        case POWERED_FLIGHT:
-          if (fmag < 2.0f && vel_up > 10.0f) {
+        case POWERED_FLIGHT: {
+          bool burnout_detected = (fmag < 2.0f && vel_up > 10.0f);
+          bool burnout_timeout  = (powered_start_ms != 0 &&
+                                   now_ms - powered_start_ms >= BURNOUT_TIMEOUT_MS);
+          if (burnout_detected || burnout_timeout) {
             flightPhase = COASTING;
             logger.logEvent(flightPhase, 2);
-            sendResponse("BO\n");
+            sendResponse(burnout_timeout && !burnout_detected ? "BO TIMEOUT\n" : "BO\n");
           }
           break;
+        }
 
         case COASTING: {
           if (!stage2_attempted) {
-            sep_count = (digitalRead(STAGE_IR_PIN) == HIGH) ? sep_count + 1 : 0; //단분리 인지 0.5초후
-            if (sep_count >= 5) {
+            sep_count = (digitalRead(STAGE_SEP_PIN) == HIGH) ? sep_count + 1 : 0; //단분리 인지 0.3초후
+            if (sep_count >= 3) {
+              // Separation is confirmed. Make exactly one ignition decision;
+              // a failed tilt check permanently inhibits stage-2 ignition.
+              stage2_attempted = true;
+
               // Tilt check via quaternion (no gimbal lock):
               // cos(tilt) = -R[2][0] = 2*(qw*qy - qx*qz)
               // 1 = vertical, 0 = horizontal, -1 = inverted
               float cos_tilt = 2.0f * (s.q[0]*s.q[2] - s.q[1]*s.q[3]);
               bool  tilt_ok  = (cos_tilt > cosf(TILT_LIMIT_DEG * (float)M_PI / 180.0f));
               if (tilt_ok) {
-                stage2_attempted = true;
                 digitalWrite(PYRO_1_PIN, HIGH);
                 pyro1_start_ms = now_ms;
                 pyro1_active   = true;
                 logger.logEvent(flightPhase, 6);  // Stage2Ignition
                 sendResponse("STAGE2 IGN\n");
               } else {
-                // Separation confirmed but tilt exceeds limit — log each cycle
+                // Separation confirmed but tilt exceeds limit — permanent abort
                 logger.logEvent(flightPhase, 5);  // NotStageCondition
-                sendResponse("NSC TILT\n");
+                sendResponse("NSC TILT - STAGE2 ABORT\n");
               }
             }
           }
@@ -432,6 +558,7 @@ void Flight_Task(void *pvParameters) {
               vTaskDelay(pdMS_TO_TICKS(100));
               logger.forceFlushBuffer();
               flightActive = false;
+              setSystemMode(SystemMode::LANDED);
               beep(500, 3);
               sendResponse("STOPPED.\n");
               landed_count = 0;
@@ -462,14 +589,59 @@ void IMU_Task(void *pvParameters) {
       xSemaphoreGive(spiMutex);
     }
 
-    if (flightActive) logger.logImu(raw);
+    SystemMode mode = getSystemMode();
+    bool preflightBuffering =
+        mode == SystemMode::READY_CONVERGING ||
+        mode == SystemMode::ARMED ||
+        mode == SystemMode::LAUNCH_VERIFY;
+    if (preflightBuffering) preTrigger.pushImu(raw);
 
+    bool launchCandidate = false;
+    if (mode == SystemMode::ARMED) {
+      launchCandidate = updateLaunchDetector(raw);
+    }
+
+    bool becameArmed = false;
+    bool verifyExpired = false;
+    float verifyBaroAltitude = 0.0f;
     if (xSemaphoreTake(navMutex, portMAX_DELAY) == pdTRUE) {
+      if (launchCandidate) {
+        nav.beginLaunchVerification(launchDetector.deltaV, raw.timestamp);
+      }
       nav.updateIMU(raw);
-      if (flightActive && nav.isKfReady()) {
+
+      if (mode == SystemMode::READY_CONVERGING && nav.isReadyStable()) {
+        becameArmed = true;
+      }
+
+      if (mode == SystemMode::LAUNCH_VERIFY &&
+          millis() - launchDetector.candidateStartMs >= LAUNCH_VERIFY_MS) {
+        verifyExpired = true;
+        verifyBaroAltitude = nav.getPress().alt;
+      }
+
+      if (mode == SystemMode::FLIGHT && nav.isKfReady()) {
         logger.logState(nav.getNominal());
       }
       xSemaphoreGive(navMutex);
+    }
+
+    if (mode == SystemMode::FLIGHT) logger.logImu(raw);
+
+    if (launchCandidate) {
+      beginLaunchVerification(raw);
+    } else if (becameArmed &&
+               getSystemMode() == SystemMode::READY_CONVERGING) {
+      setSystemMode(SystemMode::ARMED);
+      sendResponse("ARMED - LAUNCH DETECTION ACTIVE\n");
+      beep(100, 2);
+    } else if (verifyExpired &&
+               getSystemMode() == SystemMode::LAUNCH_VERIFY) {
+      if (verifyBaroAltitude >= LAUNCH_VERIFY_ALT_M) {
+        confirmLaunch();
+      } else {
+        rejectFalseLaunch(raw.timestamp);
+      }
     }
   }
 }
@@ -485,7 +657,13 @@ void BMP_Task(void *pvParameters) {
       xSemaphoreGive(spiMutex);
     }
 
-    if (flightActive) logger.logBaro(p);
+    SystemMode mode = getSystemMode();
+    bool preflightBuffering =
+        mode == SystemMode::READY_CONVERGING ||
+        mode == SystemMode::ARMED ||
+        mode == SystemMode::LAUNCH_VERIFY;
+    if (preflightBuffering) preTrigger.pushBaro(p);
+    if (mode == SystemMode::FLIGHT) logger.logBaro(p);
 
     if (xSemaphoreTake(navMutex, portMAX_DELAY) == pdTRUE) {
       nav.updatePress(p);
@@ -538,4 +716,168 @@ void attachSensorInterrupts() {
 void detachSensorInterrupts() {
   detachInterrupt(digitalPinToInterrupt(IMU_INT1_PIN));
   detachInterrupt(digitalPinToInterrupt(BMP_INT_PIN));
+}
+
+SystemMode getSystemMode() {
+  portENTER_CRITICAL(&modeMux);
+  SystemMode mode = systemMode;
+  portEXIT_CRITICAL(&modeMux);
+  return mode;
+}
+
+void setSystemMode(SystemMode mode) {
+  portENTER_CRITICAL(&modeMux);
+  systemMode = mode;
+  portEXIT_CRITICAL(&modeMux);
+}
+
+void resetLaunchDetector() {
+  launchDetector = LaunchDetectorState{};
+}
+
+bool updateLaunchDetector(const Raw_imu &raw) {
+  static constexpr float ACCEL_SCALE =
+      0.976f * 0.001f * 9.80665f;
+  const float accelX = (float)raw.ax * ACCEL_SCALE;
+  const float trigger = LAUNCH_ACCEL_THRESHOLD_G * 9.80665f;
+  const float reset = LAUNCH_RESET_THRESHOLD_G * 9.80665f;
+
+  if (!launchDetector.candidate) {
+    if (accelX < trigger) return false;
+
+    launchDetector.candidate = true;
+    launchDetector.firstTimestampUs = raw.timestamp;
+    launchDetector.lastTimestampUs = raw.timestamp;
+    launchDetector.candidateStartMs = millis();
+    launchDetector.belowResetStartMs = 0;
+    launchDetector.deltaV = 0.0f;
+    return false;
+  }
+
+  float dt = (float)(raw.timestamp - launchDetector.lastTimestampUs) * 1e-6f;
+  launchDetector.lastTimestampUs = raw.timestamp;
+  if (dt > 0.0f && dt < 0.1f) {
+    launchDetector.deltaV += fmaxf(accelX - 9.80665f, 0.0f) * dt;
+  }
+
+  if (accelX < reset) {
+    if (launchDetector.belowResetStartMs == 0) {
+      launchDetector.belowResetStartMs = millis();
+    } else if (millis() - launchDetector.belowResetStartMs >=
+               LAUNCH_RESET_HOLD_MS) {
+      resetLaunchDetector();
+      return false;
+    }
+  } else {
+    launchDetector.belowResetStartMs = 0;
+  }
+
+  return launchDetector.deltaV >= LAUNCH_DV_THRESHOLD_MPS;
+}
+
+void beginLaunchVerification(const Raw_imu &raw) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (getSystemMode() != SystemMode::ARMED) {
+    xSemaphoreGive(stateMutex);
+    return;
+  }
+
+  setSystemMode(SystemMode::LAUNCH_VERIFY);
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  bmp.freezeReference();
+  xSemaphoreGive(spiMutex);
+
+  launchStartMs = launchDetector.candidateStartMs;
+  xSemaphoreGive(stateMutex);
+  sendResponse("LAUNCH CANDIDATE - VERIFYING 1s/5m\n");
+}
+
+void confirmLaunch() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (getSystemMode() != SystemMode::LAUNCH_VERIFY) {
+    xSemaphoreGive(stateMutex);
+    return;
+  }
+
+  setSystemMode(SystemMode::LAUNCH_COMMIT);
+  preTrigger.freeze();
+  logger.setEnabled(true);
+
+  const size_t count = preTrigger.size();
+  PreTriggerBuffer::Record record;
+  for (size_t i = 0; i < count; i++) {
+    if (!preTrigger.getOldest(i, record)) break;
+    if (record.type == PreTriggerBuffer::RECORD_IMU) {
+      logger.logImu(record.imu);
+    } else if (record.type == PreTriggerBuffer::RECORD_BARO) {
+      logger.logBaro(record.baro);
+    }
+  }
+  preTrigger.clear();
+
+  flightActive = true;
+  setSystemMode(SystemMode::FLIGHT);
+  xSemaphoreGive(stateMutex);
+  xTaskNotifyGive(FlightTaskHandle);
+}
+
+void rejectFalseLaunch(uint32_t timestamp) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (getSystemMode() != SystemMode::LAUNCH_VERIFY) {
+    xSemaphoreGive(stateMutex);
+    return;
+  }
+
+  setSystemMode(SystemMode::LAUNCH_COMMIT);
+  xSemaphoreTake(navMutex, portMAX_DELAY);
+  nav.resumeZuptAfterFalseLaunch(timestamp);
+  xSemaphoreGive(navMutex);
+
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  bmp.startReferenceTracking(READY_BARO_REF_TAU_S);
+  xSemaphoreGive(spiMutex);
+
+  preTrigger.clear();
+  resetLaunchDetector();
+  setSystemMode(SystemMode::READY_CONVERGING);
+  xSemaphoreGive(stateMutex);
+  sendResponse("FALSE LAUNCH REJECTED - RECONVERGING\n");
+}
+
+void disarmSystem() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  SystemMode mode = getSystemMode();
+
+  digitalWrite(PYRO_1_PIN, LOW);
+  digitalWrite(PYRO_2_PIN, LOW);
+
+  if (mode == SystemMode::FLIGHT) {
+    // The command is acknowledged, but an in-flight packet cannot disable
+    // navigation, logging, or recovery deployment.
+    xSemaphoreGive(stateMutex);
+    sendResponse("DISARM ACK - ACTIVE FLIGHT CONTINUES\n");
+    return;
+  }
+
+  if (logger.isEnabled()) {
+    logger.setEnabled(false);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    logger.forceFlushBuffer();
+  }
+
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  bmp.freezeReference();
+  xSemaphoreGive(spiMutex);
+
+  xSemaphoreTake(navMutex, portMAX_DELAY);
+  nav.kfReset();
+  xSemaphoreGive(navMutex);
+
+  preTrigger.clear();
+  resetLaunchDetector();
+  flightActive = false;
+  setSystemMode(SystemMode::IDLE);
+  xSemaphoreGive(stateMutex);
+  sendResponse("DISARMED\n");
+  beep(100);
 }

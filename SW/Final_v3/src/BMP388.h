@@ -16,6 +16,9 @@ private:
 
     // Pad pressure stored from calibrate()
     float _pad_p = 101325.0f;
+    bool _reference_tracking = false;
+    float _reference_tau_s = 15.0f;
+    uint32_t _last_reference_ms = 0;
 
     static const uint8_t REG_CHIP_ID    = 0x00;
     static const uint8_t REG_DATA_0     = 0x04;
@@ -49,6 +52,10 @@ public:
 
     // Altitude above pad (m), using stored _pad_p
     bool readAltitude(float &alt);
+
+    // Slowly follow ambient pressure during READY, then freeze at START.
+    void startReferenceTracking(float tauSeconds);
+    void freezeReference();
 };
 
 #endif

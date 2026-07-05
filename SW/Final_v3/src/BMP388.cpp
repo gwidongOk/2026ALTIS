@@ -99,9 +99,32 @@ bool BMP388::calibrate(uint16_t nSamples) {
 bool BMP388::readAltitude(float &alt) {
     float p;
     if (!readData(p)) return false;
+
+    if (_reference_tracking) {
+        uint32_t now_ms = millis();
+        if (_last_reference_ms != 0) {
+            float dt = (float)(now_ms - _last_reference_ms) * 1.0e-3f;
+            if (dt > 0.0f && dt < 1.0f) {
+                float alpha = 1.0f - expf(-dt / _reference_tau_s);
+                _pad_p += alpha * (p - _pad_p);
+            }
+        }
+        _last_reference_ms = now_ms;
+    }
+
     // Barometric: alt = 44330 * (1 - (p/p0)^(1/5.255))
     alt = 44330.0f * (1.0f - powf(p / _pad_p, 0.1903f));
     return true;
+}
+
+void BMP388::startReferenceTracking(float tauSeconds) {
+    _reference_tau_s = fmaxf(tauSeconds, 1.0f);
+    _last_reference_ms = millis();
+    _reference_tracking = true;
+}
+
+void BMP388::freezeReference() {
+    _reference_tracking = false;
 }
 
 uint8_t BMP388::readRegister(uint8_t reg) {

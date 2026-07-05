@@ -1,4 +1,5 @@
 #include "NAV.h"
+#include "Config.h"
 
 using namespace Eigen;
 
@@ -20,22 +21,47 @@ void NAV::updateIMU(const Raw_imu &raw) {
     if (_last_imu_time_us > 0 && _kf_ready) {
         float dt = (float)(now_us - _last_imu_time_us) * 1e-6f;
         if (dt > 0 && dt < 1.0f) {
-            // 1. Gyro -> quaternion integration
-            Vector3f w(_state_imu.gx, _state_imu.gy, _state_imu.gz);
-            integrateQuaternion(w, dt);
+            Vector3f w_raw(_state_imu.gx, _state_imu.gy, _state_imu.gz);
+            Vector3f f_raw(_state_imu.ax, _state_imu.ay, _state_imu.az);
 
-            // 2. Body specific force -> NED kinematic accel
-            Vector3f f_body(_state_imu.ax, _state_imu.ay, _state_imu.az);
-            Vector3f a_ned = _q * f_body + _g_ned;
+            if (_zupt_active) {
+                // Keep the previous estimate and discard only measurements
+                // that fail the launch-pad stationarity gates.
+                _zupt_elapsed_s += dt;
+                Vector3f w_corrected = w_raw - _gyro_bias;
+                float accel_error = fabsf(f_raw.norm() - 9.80665f);
+                float gyro_limit = READY_GYRO_RATE_LIMIT_DPS * (float)M_PI / 180.0f;
+                bool stationary = (accel_error <= READY_ACCEL_NORM_TOL_MPS2 &&
+                                   w_corrected.norm() <= gyro_limit);
 
-            // 3. D (altitude): KF predict
-            float acc_up = -a_ned.z();
-            _kf.predict(acc_up, dt);
+                if (stationary) {
+                    float alpha = 1.0f - expf(-dt / READY_GYRO_BIAS_TAU_S);
+                    _gyro_bias += alpha * (w_raw - _gyro_bias);
+                    _zupt_valid_s += dt;
+                    _ready_stable_s += dt;
+                } else {
+                    _ready_stable_s = 0.0f;
+                }
 
-            // 4. NE: pure dead-reckoning integration (no observation)
-            Vector2f a_ne(a_ned.x(), a_ned.y());
-            _pos_ne += _vel_ne * dt + 0.5f * a_ne * dt * dt;
-            _vel_ne += a_ne * dt;
+                _pos_ne.setZero();
+                _vel_ne.setZero();
+            } else {
+                // 1. Bias-corrected gyro -> quaternion integration
+                Vector3f w = w_raw - _gyro_bias;
+                integrateQuaternion(w, dt);
+
+                // 2. Body specific force (bias corrected in CALIBRATE) -> NED accel
+                Vector3f a_ned = _q * f_raw + _g_ned;
+
+                // 3. D (altitude): KF predict
+                float acc_up = -a_ned.z();
+                _kf.predict(acc_up, dt);
+
+                // 4. NE: pure dead-reckoning integration (no observation)
+                Vector2f a_ne(a_ned.x(), a_ned.y());
+                _pos_ne += _vel_ne * dt + 0.5f * a_ne * dt * dt;
+                _vel_ne += a_ne * dt;
+            }
 
             syncNominal();
         }
@@ -89,8 +115,7 @@ bool NAV::kfBegin() {
     static constexpr float MAX_ALIGN_ACCEL = 1.5f * 9.80665f;
 
     // 1. Orientation alignment from averaged accelerometer samples.
-    // The rocket must be vertical and motionless. In this mounting, the
-    // calibrated accelerometer should read about +1 g on body X.
+    // The rocket must be stationary at its actual launch-rail angle.
     Vector3f sum_a = Vector3f::Zero();
     int count = 0;
     uint32_t last_t = 0;
@@ -130,6 +155,70 @@ bool NAV::kfBegin() {
     return true;
 }
 
+void NAV::beginZupt() {
+    if (!_kf_ready) return;
+
+    _gyro_bias.setZero();
+    _zupt_elapsed_s = 0.0f;
+    _zupt_valid_s = 0.0f;
+    _ready_stable_s = 0.0f;
+    _zupt_active = true;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)_state_imu.timestamp;
+    syncNominal();
+}
+
+void NAV::endZupt() {
+    if (!_kf_ready) return;
+
+    _zupt_active = false;
+    saveLaunchReference();
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)_state_imu.timestamp;
+    syncNominal();
+}
+
+void NAV::beginLaunchVerification(float initialVelocity, uint32_t timestamp) {
+    if (!_kf_ready) return;
+
+    _zupt_active = false;
+    if (_launch_ref_valid) _q = _launch_ref_q;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, initialVelocity);
+    _last_imu_time_us = (int64_t)timestamp;
+    syncNominal();
+}
+
+void NAV::resumeZuptAfterFalseLaunch(uint32_t timestamp) {
+    if (!_kf_ready) return;
+
+    if (_launch_ref_valid) _q = _launch_ref_q;
+    _zupt_active = true;
+    _ready_stable_s = 0.0f;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)timestamp;
+    syncNominal();
+}
+
+void NAV::getResidualGyroBias(float gyro[3]) const {
+    gyro[0] = _gyro_bias.x();
+    gyro[1] = _gyro_bias.y();
+    gyro[2] = _gyro_bias.z();
+}
+
+bool NAV::isReadyStable() const {
+    return _zupt_active &&
+           _zupt_valid_s >= READY_MIN_VALID_S &&
+           _ready_stable_s >= READY_STABLE_MIN_S;
+}
+
 void NAV::saveLaunchReference() {
     _launch_ref_q = _q.normalized();
     _launch_ref_valid = true;
@@ -147,6 +236,11 @@ void NAV::resetHorizontalAndAttitudeToReference() {
 
 void NAV::kfReset() {
     _kf_ready = false;
+    _zupt_active = false;
+    _zupt_elapsed_s = 0.0f;
+    _zupt_valid_s = 0.0f;
+    _ready_stable_s = 0.0f;
+    _gyro_bias.setZero();
     _q.setIdentity();
     _launch_ref_q.setIdentity();
     _launch_ref_valid = false;

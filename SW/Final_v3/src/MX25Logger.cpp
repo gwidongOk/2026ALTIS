@@ -2,6 +2,82 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+// ============================================================
+// PreTriggerBuffer
+// ============================================================
+bool PreTriggerBuffer::begin(size_t capacity) {
+  if (capacity == 0) return false;
+
+  _records = static_cast<Record *>(heap_caps_malloc(
+      capacity * sizeof(Record), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!_records) return false;
+
+  _capacity = capacity;
+  clear();
+  return true;
+}
+
+void PreTriggerBuffer::clear() {
+  portENTER_CRITICAL(&_mux);
+  _head = 0;
+  _count = 0;
+  _frozen = false;
+  portEXIT_CRITICAL(&_mux);
+}
+
+void PreTriggerBuffer::freeze() {
+  portENTER_CRITICAL(&_mux);
+  _frozen = true;
+  portEXIT_CRITICAL(&_mux);
+}
+
+void PreTriggerBuffer::pushImu(const Raw_imu &raw) {
+  Record record = {};
+  record.type = RECORD_IMU;
+  record.imu = raw;
+  push(record);
+}
+
+void PreTriggerBuffer::pushBaro(const Raw_press &baro) {
+  Record record = {};
+  record.type = RECORD_BARO;
+  record.baro = baro;
+  push(record);
+}
+
+void PreTriggerBuffer::push(const Record &record) {
+  portENTER_CRITICAL(&_mux);
+  if (!_records || _capacity == 0 || _frozen) {
+    portEXIT_CRITICAL(&_mux);
+    return;
+  }
+
+  _records[_head] = record;
+  _head = (_head + 1) % _capacity;
+  if (_count < _capacity) _count++;
+  portEXIT_CRITICAL(&_mux);
+}
+
+size_t PreTriggerBuffer::size() {
+  portENTER_CRITICAL(&_mux);
+  size_t count = _count;
+  portEXIT_CRITICAL(&_mux);
+  return count;
+}
+
+bool PreTriggerBuffer::getOldest(size_t index, Record &out) {
+  portENTER_CRITICAL(&_mux);
+  if (!_records || index >= _count) {
+    portEXIT_CRITICAL(&_mux);
+    return false;
+  }
+
+  size_t oldest = (_head + _capacity - _count) % _capacity;
+  out = _records[(oldest + index) % _capacity];
+  portEXIT_CRITICAL(&_mux);
+  return true;
+}
+
 #define CMD_WREN         0x06
 #define CMD_RDSR         0x05
 #define CMD_WRITE        0x02
@@ -11,8 +87,6 @@
 #define CMD_CHIP_ERASE   0xC7
 
 // NVS 키
-static const char* NVS_NAMESPACE = "mx25log";
-static const char* NVS_KEY_ADDR  = "endAddr";
 
 MX25Logger::MX25Logger() {
   _spi = nullptr;
@@ -21,12 +95,38 @@ MX25Logger::MX25Logger() {
   _bufferMutex = xSemaphoreCreateMutex();
   _spiMutex = nullptr;
   _queue = NULL;
+  _queueStorage = nullptr;
+  _queueLength = 0;
+  _droppedItems = 0;
   _enabled = false;
 }
 
 bool MX25Logger::begin(SPIClass *spi, int sck, int miso, int mosi, int cs, SemaphoreHandle_t spiMutex) {
-  _queue = xQueueCreate(QUEUE_LENGTH, sizeof(Item));
+  // Keep 2 MB PSRAM in reserve for the rest of the application and use the
+  // remainder for the logging queue. This board has 8 MB PSRAM.
+  size_t freePsram = ESP.getFreePsram();
+  if (freePsram > PSRAM_RESERVE_BYTES) {
+    size_t usableBytes = freePsram - PSRAM_RESERVE_BYTES;
+    _queueLength = usableBytes / sizeof(Item);
+    if (_queueLength > MAX_QUEUE_ITEMS) _queueLength = MAX_QUEUE_ITEMS;
+
+    size_t queueBytes = _queueLength * sizeof(Item);
+    _queueStorage = (uint8_t *)heap_caps_malloc(
+        queueBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (_queueStorage) {
+      _queue = xQueueCreateStatic(
+          (UBaseType_t)_queueLength, sizeof(Item), _queueStorage, &_queueControl);
+    }
+  }
+
+  // No internal-RAM fallback: if the PSRAM queue can't be allocated, fail
+  // the boot the same way every other critical init failure does (caller
+  // halts on a false return) rather than silently logging with a queue too
+  // small to be useful.
   if (!_queue) return false;
+  Serial.printf("Log queue: %u items (%u bytes) in PSRAM\n",
+                (unsigned)_queueLength,
+                (unsigned)(_queueLength * sizeof(Item)));
 
   _spi = spi;
   _csPin = cs;
@@ -44,35 +144,9 @@ bool MX25Logger::begin(SPIClass *spi, int sck, int miso, int mosi, int cs, Semap
   vTaskDelay(pdMS_TO_TICKS(10));
 
   // NVS에서 이전 기록 종료 주소 복원
-  loadAddress();
+  _currentFlashAddress = START_ADDRESS;
 
   return true;
-}
-
-// ============================================================
-// NVS 영속 저장
-// ============================================================
-void MX25Logger::saveAddress() {
-  _prefs.begin(NVS_NAMESPACE, false);
-  _prefs.putUInt(NVS_KEY_ADDR, _currentFlashAddress);
-  _prefs.end();
-}
-
-void MX25Logger::loadAddress() {
-  _prefs.begin(NVS_NAMESPACE, true);   // read-only
-  _currentFlashAddress = _prefs.getUInt(NVS_KEY_ADDR, START_ADDRESS);
-  _prefs.end();
-
-  // 유효성 검증: 범위 밖이면 리셋 (NVS 손상 또는 칩 교체 대응)
-  if (_currentFlashAddress < START_ADDRESS || _currentFlashAddress >= MAX_ADDRESS) {
-    Serial.printf("Flash addr 0x%08X out of range — resetting to START\n", _currentFlashAddress);
-    _currentFlashAddress = START_ADDRESS;
-  }
-
-  Serial.printf("Flash resume addr: 0x%08X (%u bytes logged, %u bytes free)\n",
-                _currentFlashAddress,
-                _currentFlashAddress - START_ADDRESS,
-                MAX_ADDRESS - _currentFlashAddress);
 }
 
 // ============================================================
@@ -138,12 +212,19 @@ void MX25Logger::writePage(uint8_t *page) {
 }
 
 void MX25Logger::forceFlushBuffer() {
+  // Logging is disabled by the caller before shutdown/dump. Drain every
+  // packet still staged in the large queue before writing the tail page.
+  Item queued;
+  while (_queue && xQueueReceive(_queue, &queued, 0) == pdTRUE) {
+    appendRaw(queued.data, queued.len);
+    if (hasFullPage()) flushPages();
+  }
+
   flushPages();
 
   xSemaphoreTake(_bufferMutex, portMAX_DELAY);
   if (_bufferIndex == 0) {
     xSemaphoreGive(_bufferMutex);
-    saveAddress();
     return;
   }
 
@@ -156,7 +237,6 @@ void MX25Logger::forceFlushBuffer() {
   // 플래시 끝 도달 시 잔여 데이터 폐기
   if (_currentFlashAddress + len > MAX_ADDRESS) {
     Serial.println("Flash FULL — dropping tail buffer");
-    saveAddress();
     return;
   }
 
@@ -178,7 +258,9 @@ void MX25Logger::forceFlushBuffer() {
   
   if (_spiMutex) xSemaphoreGive(_spiMutex);
 
-  saveAddress();
+  if (_droppedItems > 0) {
+    Serial.printf("Log queue dropped %u packets\n", (unsigned)_droppedItems);
+  }
 }
 
 // ============================================================
@@ -187,10 +269,8 @@ void MX25Logger::forceFlushBuffer() {
 void MX25Logger::dumpRawBinary(Stream &out) {
   uint32_t readAddr = START_ADDRESS;
   uint8_t buffer[256];
-  uint32_t totalBytes = _currentFlashAddress - START_ADDRESS;
-
-  while (readAddr < _currentFlashAddress) {
-    uint32_t readLen = _currentFlashAddress - readAddr;
+  while (readAddr < MAX_ADDRESS) {
+    uint32_t readLen = MAX_ADDRESS - readAddr;
     if (readLen > 256) readLen = 256;
 
     readFlash(readAddr, buffer, readLen);
@@ -224,8 +304,8 @@ void MX25Logger::eraseAll() {
 
   _currentFlashAddress = START_ADDRESS;
   _bufferIndex = 0;
+  _droppedItems = 0;
 
-  saveAddress();
 }
 
 // ============================================================
@@ -329,5 +409,7 @@ void MX25Logger::_push(const void *pkt, uint8_t len) {
   Item item;
   item.len = len;
   memcpy(item.data, pkt, len);
-  xQueueSend(_queue, &item, 0);
+  if (xQueueSend(_queue, &item, 0) != pdTRUE) {
+    _droppedItems++;
+  }
 }

@@ -20,16 +20,11 @@
 #define FLASH_MOSI_PIN  15
 #define FLASH_CS_PIN    6
 
-// Magnetometer I2C
-#define MAG_SDA_PIN  5
-#define MAG_SCL_PIN  4
-
-// GPS UART (Serial1) — NOTE: GPS_TX_PIN (1) is repurposed for STAGE_IR_PIN below
-#define GPS_RX_PIN   2
-//#define GPS_TX_PIN 1   // disabled: shared with STAGE_IR_PIN
-
-// Stage-separation IR sensor (FC-51 digital out): HIGH = separated, LOW = still attached
-#define STAGE_IR_PIN  1
+// Stage-separation Hall sensor: open-drain/active-low, external 4.7k pull-up
+// on the board. HIGH = separated (or sensor disconnected/unpowered — these
+// are NOT distinguishable with the magnet mounted as it is now; see the
+// pinMode(STAGE_SEP_PIN, ...) comment in main.cpp's setup()).
+#define STAGE_SEP_PIN  1
 
 //BUZZER
 #define BUZZER_PIN   17
@@ -67,12 +62,37 @@
 // ============================================================
 // Sensor & Logic Parameters
 // ============================================================
-#define CALIB_SAMPLES     100
+// Vertical IMU calibration: 5 s warm-up + about 10 s sampling at 3 ms/sample
+#define IMU_CALIB_WARMUP_MS       5000
+#define IMU_CALIB_SAMPLES         3333
+#define BARO_ZERO_SAMPLES         100
+
+// READY is expected to last about one minute.
+#define READY_GYRO_BIAS_TAU_S     10.0f
+#define READY_BARO_REF_TAU_S      15.0f
+#define READY_MIN_VALID_S         30.0f
+#define READY_STABLE_MIN_S        5.0f
+
+// Initial stationarity gates; tune from pad test data if necessary.
+#define READY_ACCEL_NORM_TOL_MPS2 1.0f
+#define READY_GYRO_RATE_LIMIT_DPS 3.0f
+
+// Launch detection / verification
+#define LAUNCH_ACCEL_THRESHOLD_G  3.0f
+#define LAUNCH_RESET_THRESHOLD_G  2.0f
+#define LAUNCH_DV_THRESHOLD_MPS   1.0f
+#define LAUNCH_RESET_HOLD_MS      20
+#define LAUNCH_VERIFY_MS          1000
+#define LAUNCH_VERIFY_ALT_M       5.0f
+
+// About 2 s before the trigger plus the 1 s verification interval.
+#define PRETRIGGER_RECORD_CAPACITY 1600
 
 // ============================================================
 // Flight Profile (2-stage)
 // ============================================================
 #define STAGE2_PULSE_MS     1000    // PYRO_1 (re-ignition) pulse width
+#define BURNOUT_TIMEOUT_MS  2000    // Fallback: force burnout transition 2 s after launch detection
 #define MAIN_DEPLOY_ALT_M   100.0f  // Altitude (AGL) to trigger PYRO_2 (main)
 #define MAIN_PULSE_MS       1000    // PYRO_2 pulse width
 #define TILT_LIMIT_DEG      45.0f   // Abort 2nd-stage ignition if tilt from vertical exceeds

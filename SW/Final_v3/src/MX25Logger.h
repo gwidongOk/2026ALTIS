@@ -3,12 +3,49 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
+#include <esp_heap_caps.h>
 
 #include "sensor_data.h"
+
+// Pre-trigger ring buffer (PSRAM): keeps recent IMU/baro samples while armed
+// so a confirmed launch can backfill the few seconds before liftoff into the
+// flash log. Lives here because it only exists to feed MX25Logger.
+class PreTriggerBuffer {
+  public:
+    enum RecordType : uint8_t {
+      RECORD_IMU  = 1,
+      RECORD_BARO = 2
+    };
+
+    struct Record {
+      uint8_t type;
+      union {
+        Raw_imu   imu;
+        Raw_press baro;
+      };
+    };
+
+    bool begin(size_t capacity);
+    void clear();
+    void freeze();
+    void pushImu(const Raw_imu &raw);
+    void pushBaro(const Raw_press &baro);
+    size_t size();
+    bool getOldest(size_t index, Record &out);
+
+  private:
+    Record *_records = nullptr;
+    size_t _capacity = 0;
+    size_t _head = 0;
+    size_t _count = 0;
+    bool _frozen = false;
+    portMUX_TYPE _mux = portMUX_INITIALIZER_UNLOCKED;
+
+    void push(const Record &record);
+};
 
 class MX25Logger {
   public:
@@ -80,7 +117,6 @@ class MX25Logger {
     uint16_t _bufferIndex;
 
     SemaphoreHandle_t _bufferMutex;
-    Preferences _prefs;
 
     const uint32_t START_ADDRESS = 0x0000000;
     // MX25L25645GM2I-08G : 256Mbit = 32MB
@@ -88,19 +124,21 @@ class MX25Logger {
 
     // ---- Typed log queue (in-RAM staging from sensor tasks → FlushTask) ----
     static const uint8_t  ITEM_MAX_SIZE = 64;   // largest packet (state_pkt = 47 B)
-    static const uint16_t QUEUE_LENGTH  = 256;
+    static const size_t   PSRAM_RESERVE_BYTES = 2 * 1024 * 1024;
+    static const size_t   MAX_QUEUE_ITEMS = 65535;
     struct Item {
       uint8_t data[ITEM_MAX_SIZE];
       uint8_t len;
     };
     QueueHandle_t _queue;
+    StaticQueue_t _queueControl;
+    uint8_t *_queueStorage;
+    size_t _queueLength;
+    volatile uint32_t _droppedItems;
     volatile bool _enabled;
     void _push(const void *pkt, uint8_t len);
 
     // NVS에 기록 종료 주소를 저장/복원
-    void saveAddress();
-    void loadAddress();
-
     void writePage(uint8_t *page);
     void readFlash(uint32_t addr, uint8_t *buf, uint32_t len);
     void eraseSector(uint32_t addr);
