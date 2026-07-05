@@ -20,10 +20,11 @@
 #define FLASH_MOSI_PIN  15
 #define FLASH_CS_PIN    6
 
-// Stage-separation Hall sensor: open-drain/active-low, external 4.7k pull-up
-// on the board. HIGH = separated (or sensor disconnected/unpowered — these
-// are NOT distinguishable with the magnet mounted as it is now; see the
-// pinMode(STAGE_SEP_PIN, ...) comment in main.cpp's setup()).
+// Stage-separation Hall sensor, external 4.7k pull-up already on the board.
+// Bench-confirmed: magnet near (joined) = HIGH, magnet far (separated) =
+// LOW. A disconnected/unpowered sensor also floats HIGH via the pull-up,
+// so HIGH always means "not separated" (joined or failed sensor) and only
+// an actively-driven LOW means genuinely separated — this fails safe.
 #define STAGE_SEP_PIN  1
 
 //BUZZER
