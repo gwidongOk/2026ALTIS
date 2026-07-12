@@ -338,14 +338,9 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(50));
         return;
       }
-      // Bench-confirmed sensor behavior: magnet near (joined) = HIGH,
-      // magnet far (separated) = LOW; disconnected also floats HIGH via
-      // the external pull-up. So LOW here means already separated (or a
-      // short) — neither should be armed. (Only checked at this instant;
-      // does not cover a failure that happens later during the
-      // READY/ARMED hold or in flight.)
-      if (digitalRead(STAGE_SEP_PIN) == LOW) {
-        sendResponse("STAGE SEP SENSOR NOT HIGH - CHECK WIRING/MAGNET\n");
+
+      if (digitalRead(STAGE_SEP_PIN) == 1) {
+        sendResponse("STAGE SEP SENSOR NOT Low - CHECK WIRING/MAGNET\n");
         vTaskDelay(pdMS_TO_TICKS(50));
         return;
       }
@@ -493,7 +488,7 @@ void Flight_Task(void *pvParameters) {
 
         case COASTING: {
           if (!stage2_attempted) {
-            sep_count = (digitalRead(STAGE_SEP_PIN) == LOW) ? sep_count + 1 : 0; //단분리 인지(LOW) 0.3초후
+            sep_count = (digitalRead(STAGE_SEP_PIN) == 1) ? sep_count + 1 : 0; //단분리 인지(High) 0.3초후
             if (sep_count >= 3) {
               // Separation is confirmed. Make exactly one ignition decision;
               // a failed tilt check permanently inhibits stage-2 ignition.
