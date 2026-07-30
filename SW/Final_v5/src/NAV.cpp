@@ -1,0 +1,282 @@
+#include "NAV.h"
+#include "Config.h"
+
+using namespace Eigen;
+
+NAV::NAV() {
+    kfReset();
+}
+
+void NAV::updateIMU(const Raw_imu &raw) {
+    _raw_imu = raw;
+    _state_imu.timestamp = raw.timestamp;
+    _state_imu.ax = (float)raw.ax * ACCEL_SCALE;
+    _state_imu.ay = (float)raw.ay * ACCEL_SCALE;
+    _state_imu.az = (float)raw.az * ACCEL_SCALE;
+    _state_imu.gx = (float)raw.gx * GYRO_SCALE;
+    _state_imu.gy = (float)raw.gy * GYRO_SCALE;
+    _state_imu.gz = (float)raw.gz * GYRO_SCALE;
+
+    int64_t now_us = (int64_t)raw.timestamp;
+    if (_last_imu_time_us > 0 && _kf_ready) {
+        float dt = (float)(now_us - _last_imu_time_us) * 1e-6f;
+        if (dt > 0 && dt < 1.0f) {
+            Vector3f w_raw(_state_imu.gx, _state_imu.gy, _state_imu.gz);
+            Vector3f f_raw(_state_imu.ax, _state_imu.ay, _state_imu.az);
+
+            if (_zupt_active) {
+                // Keep the previous estimate and discard only measurements
+                // that fail the launch-pad stationarity gates.
+                _zupt_elapsed_s += dt;
+                Vector3f w_corrected = w_raw - _gyro_bias;
+                float accel_error = fabsf(f_raw.norm() - 9.80665f);
+                float gyro_limit = READY_GYRO_RATE_LIMIT_DPS * (float)M_PI / 180.0f;
+                bool stationary = (accel_error <= READY_ACCEL_NORM_TOL_MPS2 &&
+                                   w_corrected.norm() <= gyro_limit);
+
+                if (stationary) {
+                    float alpha = 1.0f - expf(-dt / READY_GYRO_BIAS_TAU_S);
+                    _gyro_bias += alpha * (w_raw - _gyro_bias);
+                    _zupt_valid_s += dt;
+                    _ready_stable_s += dt;
+                } else {
+                    _ready_stable_s = 0.0f;
+                }
+
+                _pos_ne.setZero();
+                _vel_ne.setZero();
+            } else {
+                // 1. Bias-corrected gyro -> quaternion integration
+                Vector3f w = w_raw - _gyro_bias;
+                integrateQuaternion(w, dt);
+
+                // 2. Body specific force (bias corrected in CALIBRATE) -> NED accel
+                Vector3f a_ned = _q * f_raw + _g_ned;
+
+                // 3. D (altitude): KF predict
+                float acc_up = -a_ned.z();
+                _kf.predict(acc_up, dt);
+
+                // 4. NE: pure dead-reckoning integration (no observation)
+                Vector2f a_ne(a_ned.x(), a_ned.y());
+                _pos_ne += _vel_ne * dt + 0.5f * a_ne * dt * dt;
+                _vel_ne += a_ne * dt;
+            }
+
+            syncNominal();
+        }
+    }
+    _last_imu_time_us = now_us;
+}
+
+void NAV::integrateQuaternion(const Vector3f& w, float dt) {
+    // q_dot = 0.5 * q * [0, w]^T — implemented via AngleAxis for stability
+    float w_norm = w.norm();
+    if (w_norm > 1e-6f) {
+        Quaternionf dq(AngleAxisf(w_norm * dt, w / w_norm));
+        _q = (_q * dq).normalized();
+    } else {
+        Quaternionf dq(1.0f, 0.5f * w.x() * dt, 0.5f * w.y() * dt, 0.5f * w.z() * dt);
+        _q = (_q * dq).normalized();
+    }
+}
+
+void NAV::updatePress(const Raw_press &p) {
+    _press = p;
+    if (_kf_ready) {
+        _kf.update(p.alt);
+        syncNominal();
+    }
+}
+
+void NAV::syncNominal() {
+    _nominal.timestamp = _state_imu.timestamp;
+
+    // NED position (NE: integrated, D: KF, Up->Down)
+    _nominal.p[0] = _pos_ne.x();
+    _nominal.p[1] = _pos_ne.y();
+    _nominal.p[2] = -_kf.getPos();
+
+    // NED velocity
+    _nominal.v[0] = _vel_ne.x();
+    _nominal.v[1] = _vel_ne.y();
+    _nominal.v[2] = -_kf.getVel();
+
+    // Quaternion
+    _nominal.q[0] = _q.w();
+    _nominal.q[1] = _q.x();
+    _nominal.q[2] = _q.y();
+    _nominal.q[3] = _q.z();
+}
+
+bool NAV::kfBegin() {
+    static constexpr int ALIGN_SAMPLE_TARGET = 400;
+
+    // 1. Orientation alignment from averaged accelerometer samples.
+    // The rocket must be stationary at its actual launch-rail angle.
+    Vector3f sum_a = Vector3f::Zero();
+    int count = 0;
+    uint32_t last_t = 0;
+    
+    // Collect about 1 second of distinct IMU samples at 416 Hz.
+    for (int i = 0; i < 2000 && count < ALIGN_SAMPLE_TARGET; i++) {
+        if (_state_imu.timestamp != last_t) {
+            sum_a += Vector3f(_state_imu.ax, _state_imu.ay, _state_imu.az);
+            last_t = _state_imu.timestamp;
+            count++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    if (count < ALIGN_SAMPLE_TARGET) {
+        Serial.printf("KF align fail: only %d IMU samples\n", count);
+        return false;
+    }
+
+    Vector3f avg_a = sum_a / (float)count;
+    return kfBeginFromAccelAverage(avg_a.x(), avg_a.y(), avg_a.z());
+}
+
+bool NAV::kfBeginFromAccelAverage(float ax, float ay, float az) {
+    static constexpr float MIN_ALIGN_ACCEL = 0.5f * 9.80665f;
+    static constexpr float MAX_ALIGN_ACCEL = 1.5f * 9.80665f;
+
+    // Single-task builds collect the samples in the real-time task and pass
+    // the average here. This avoids blocking while waiting for a second IMU
+    // task that no longer exists.
+    Vector3f avg_a(ax, ay, az);
+    float accel_norm = avg_a.norm();
+    if (accel_norm < MIN_ALIGN_ACCEL || accel_norm > MAX_ALIGN_ACCEL) {
+        Serial.printf("KF align fail: accel norm %.3f m/s^2\n", accel_norm);
+        return false;
+    }
+
+    avg_a /= accel_norm;
+    // Specific force points upward at rest. Map body-frame +g direction to NED Up.
+    _q = Quaternionf::FromTwoVectors(avg_a, Vector3f(0.0f, 0.0f, -1.0f));
+    saveLaunchReference();
+
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(_press.alt, 0.0f);
+    _kf_ready = true;
+    _last_imu_time_us = (int64_t)_state_imu.timestamp;
+    syncNominal();
+    return true;
+}
+
+void NAV::beginZupt() {
+    if (!_kf_ready) return;
+
+    _gyro_bias.setZero();
+    _zupt_elapsed_s = 0.0f;
+    _zupt_valid_s = 0.0f;
+    _ready_stable_s = 0.0f;
+    _zupt_active = true;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)_state_imu.timestamp;
+    syncNominal();
+}
+
+void NAV::endZupt() {
+    if (!_kf_ready) return;
+
+    _zupt_active = false;
+    saveLaunchReference();
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)_state_imu.timestamp;
+    syncNominal();
+}
+
+void NAV::beginLaunchVerification(float initialVelocity, uint32_t timestamp) {
+    if (!_kf_ready) return;
+
+    _zupt_active = false;
+    if (_launch_ref_valid) _q = _launch_ref_q;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, initialVelocity);
+    _last_imu_time_us = (int64_t)timestamp;
+    syncNominal();
+}
+
+void NAV::resumeZuptAfterFalseLaunch(uint32_t timestamp) {
+    if (!_kf_ready) return;
+
+    if (_launch_ref_valid) _q = _launch_ref_q;
+    _zupt_active = true;
+    _ready_stable_s = 0.0f;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _last_imu_time_us = (int64_t)timestamp;
+    syncNominal();
+}
+
+void NAV::getResidualGyroBias(float gyro[3]) const {
+    gyro[0] = _gyro_bias.x();
+    gyro[1] = _gyro_bias.y();
+    gyro[2] = _gyro_bias.z();
+}
+
+bool NAV::isReadyStable() const {
+    return _zupt_active &&
+           _zupt_valid_s >= READY_MIN_VALID_S &&
+           _ready_stable_s >= READY_STABLE_MIN_S;
+}
+
+void NAV::saveLaunchReference() {
+    _launch_ref_q = _q.normalized();
+    _launch_ref_valid = true;
+}
+
+void NAV::resetHorizontalAndAttitudeToReference() {
+    if (_launch_ref_valid) {
+        _q = _launch_ref_q;
+    }
+
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    syncNominal();
+}
+
+void NAV::kfReset() {
+    _kf_ready = false;
+    _zupt_active = false;
+    _zupt_elapsed_s = 0.0f;
+    _zupt_valid_s = 0.0f;
+    _ready_stable_s = 0.0f;
+    _gyro_bias.setZero();
+    _q.setIdentity();
+    _launch_ref_q.setIdentity();
+    _launch_ref_valid = false;
+    _pos_ne.setZero();
+    _vel_ne.setZero();
+    _kf.init(0.0f, 0.0f);
+    _nominal = State_nominal{};
+    _nominal.q[0] = 1.0f;
+    _last_imu_time_us = 0;
+}
+
+void NAV::quatToEuler(float qw, float qx, float qy, float qz,
+                      float &roll, float &pitch, float &yaw) {
+    // ZYX (yaw -> pitch -> roll) convention
+    // roll (X)
+    float sinr_cosp = 2.0f * (qw * qx + qy * qz);
+    float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
+    roll = atan2f(sinr_cosp, cosr_cosp);
+
+    // pitch (Y) — clamp for gimbal lock
+    float sinp = 2.0f * (qw * qy - qz * qx);
+    if (fabsf(sinp) >= 1.0f) pitch = copysignf((float)M_PI * 0.5f, sinp);
+    else                     pitch = asinf(sinp);
+
+    // yaw (Z)
+    float siny_cosp = 2.0f * (qw * qz + qx * qy);
+    float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
+    yaw = atan2f(siny_cosp, cosy_cosp);
+}
