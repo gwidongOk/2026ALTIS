@@ -97,7 +97,7 @@
 // Flight Profile (2-stage)
 // ============================================================
 #define STAGE2_PULSE_MS     1000    // PYRO_1 (re-ignition) pulse width
-#define STAGE2_IGNITION_TIMEOUT_MS 2000 // No stage-2 ignition after COASTING -> apogee/drogue
+#define STAGE2_IGNITION_TIMEOUT_MS 1000 // No stage-2 ignition after COASTING -> apogee/drogue
 #define STAGE2_APOGEE_TIMEOUT_MS 8500 // Backup apogee after stage-2 ignition
 #define BURNOUT_TIMEOUT_MS  2000    // Fallback: force burnout transition 2 s after launch detection
 #define MAIN_DEPLOY_ALT_M   100.0f  // Altitude (AGL) to trigger PYRO_2 (main)
